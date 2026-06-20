@@ -25,8 +25,49 @@ solicitacoes = {}
 def gerar_senha(tamanho=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=tamanho))
 
-# === MOTOR DE AÇÕES ===
+# === THREAD DE MONITORAMENTO MIKROTIK ===
+def monitorar_conexoes():
+    while True:
+        try:
+            # Filtra apenas os usuários que estão aprovados
+            aprovados = {mac: dados for mac, dados in solicitacoes.items() if dados.get("status") == "aprovado"}
+            
+            if aprovados:
+                conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
+                api = conexao.get_api()
+                
+                # Busca usuários ativos e todos os usuários cadastrados
+                usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
+                todos_usuarios = api.get_resource('/ip/hotspot/user').get()
+                
+                ativos_dict = {u.get('user'): u for u in usuarios_ativos}
+                users_dict = {u.get('name'): u for u in todos_usuarios}
 
+                for mac, dados in aprovados.items():
+                    usuario = dados.get("user")
+                    
+                    if usuario in ativos_dict:
+                        dados["is_online"] = True
+                        info_ativo = ativos_dict[usuario]
+                        dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
+                    else:
+                        dados["is_online"] = False
+                        if usuario in users_dict:
+                            info_user = users_dict[usuario]
+                            if info_user.get("limit-uptime", "0s") == "0s":
+                                dados["time_left"] = "Ilimitado"
+                            else:
+                                dados["time_left"] = "Pausado (Offline)"
+                        else:
+                            dados["time_left"] = "Desconhecido"
+                
+                conexao.disconnect()
+        except Exception as e:
+            print(f"Erro no monitoramento do MikroTik: {e}")
+        
+        time.sleep(10) # Atualiza a cada 10 segundos
+
+# === MOTOR DE AÇÕES ===
 def executar_acao(acao, mac):
     if mac not in solicitacoes:
         return False, "nao_encontrado", "Solicitação não encontrada."
@@ -34,12 +75,11 @@ def executar_acao(acao, mac):
     nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
-        # ATENÇÃO: Os nomes abaixo (profile_mk) devem ser IGUAIS aos do seu MikroTik
-        if "10m" in acao: profile_mk = "10m"; txt_tempo = "10 Minutos"
-        elif "30m" in acao: profile_mk = "30m"; txt_tempo = "30 Minutos"
-        elif "1h" in acao: profile_mk = "1h"; txt_tempo = "1 Hora"
-        elif "5h" in acao: profile_mk = "5h"; txt_tempo = "5 Horas"
-        else: profile_mk = "Ilimitado"; txt_tempo = "Tempo Ilimitado"
+        if "10m" in acao: tempo = "00:10:00"; txt_tempo = "10 Minutos"
+        elif "30m" in acao: tempo = "00:30:00"; txt_tempo = "30 Minutos"
+        elif "1h" in acao: tempo = "01:00:00"; txt_tempo = "1 Hora"
+        elif "5h" in acao: tempo = "05:00:00"; txt_tempo = "5 Horas"
+        else: tempo = "ilimitado"; txt_tempo = "Tempo Ilimitado"
         
         usuario_gerado = f"vis_{mac.replace(':', '')}"
         senha_gerada = gerar_senha()
@@ -51,15 +91,16 @@ def executar_acao(acao, mac):
             
             usuarios_existentes = recurso_user.get(name=usuario_gerado)
             
-            # Agora injetamos o PROFILE dinâmico e tiramos o limit-uptime individual
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
-                'profile': profile_mk,
+                'profile': 'convidado',
                 'disabled': 'false',
-                'comment': f"Nome: {nome_cliente}",
-                'limit-uptime': '0s' # Zera o limite local do usuário para que o Profile comande as regras
+                'comment': f"Nome: {nome_cliente}"
             }
+            
+            if tempo != "ilimitado": parametros_mk['limit-uptime'] = tempo
+            else: parametros_mk['limit-uptime'] = '0s'
 
             if usuarios_existentes:
                 parametros_mk['id'] = usuarios_existentes[0]['id']
@@ -74,8 +115,8 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
 
-            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada})
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Plano/Profile:* {profile_mk}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             return True, "aprovado", msg
 
         except Exception as e:
@@ -100,15 +141,13 @@ def executar_acao(acao, mac):
                 api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
             conexao.disconnect()
-            solicitacoes[mac]["status"] = "desconectado"
+            solicitacoes[mac].update({"status": "desconectado", "is_online": False, "time_left": "-"})
             return True, "desconectado", f"🛑 *Usuário Desconectado!*\n\nA conexão de {nome_cliente} ({usuario_gerado}) foi encerrada."
             
         except Exception as e:
             return False, "erro", f"Erro ao desconectar no MikroTik: {e}"
 
-
 # === ROTAS DA API HOTSPOT E TELEGRAM ===
-
 @app.route('/solicitar', methods=['POST'])
 def solicitar():
     dados = request.json
@@ -129,7 +168,8 @@ def solicitar():
     msg_enviada = bot.send_message(ADMIN_CHAT_ID, mensagem, parse_mode="Markdown", reply_markup=markup)
     
     solicitacoes[mac] = {
-        "status": "pendente", "user": "", "password": "", "ip": ip, "nome": nome, "message_id": msg_enviada.message_id
+        "status": "pendente", "user": "", "password": "", "ip": ip, "nome": nome, 
+        "message_id": msg_enviada.message_id, "is_online": False, "time_left": "-"
     }
 
     return jsonify({"message": "Solicitação enviada"}), 200
@@ -146,7 +186,6 @@ def admin_dados():
 
 
 # === PAINEL DE GERÊNCIA WEB AVANÇADO ===
-
 HTML_ADMIN = """
 <!DOCTYPE html>
 <html lang="pt-br">
@@ -157,7 +196,7 @@ HTML_ADMIN = """
     <style>
         * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         body { background-color: #eef2f5; padding: 20px; color: #333; margin: 0; }
-        .container { max-width: 1000px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
+        .container { max-width: 1050px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
         h2 { text-align: center; color: #2563eb; margin-top: 0; }
         
         #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 5px; padding: 16px; position: fixed; z-index: 1; right: 20px; top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: 0.3s; }
@@ -183,6 +222,11 @@ HTML_ADMIN = """
         
         .live-indicator { display: inline-block; width: 8px; height: 8px; background-color: #10b981; border-radius: 50%; margin-right: 5px; animation: blink 1.5s infinite; }
         @keyframes blink { 0% {opacity: 1;} 50% {opacity: 0.4;} 100% {opacity: 1;} }
+        
+        .conexao-info { font-size: 12px; margin-top: 5px; font-weight: 500;}
+        .online { color: #10b981; }
+        .offline { color: #ef4444; }
+        .tempo { color: #64748b; font-size: 11px; }
     </style>
 </head>
 <body>
@@ -191,7 +235,7 @@ HTML_ADMIN = """
     <div class="container">
         <h2>Painel de Gerência Hotspot</h2>
         <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
-            <span class="live-indicator"></span> Sincronizado em tempo real com o Telegram
+            <span class="live-indicator"></span> Sincronizado em tempo real com MikroTik & Telegram
         </div>
         
         <table id="tabela-solicitacoes">
@@ -199,7 +243,7 @@ HTML_ADMIN = """
                 <tr>
                     <th>Visitante / MAC</th>
                     <th>IP</th>
-                    <th>Status</th>
+                    <th>Status / Conexão</th>
                     <th>Ações Rápidas</th>
                 </tr>
             </thead>
@@ -255,6 +299,7 @@ HTML_ADMIN = """
                     const req = data[mac];
                     let botoes = '';
                     let statusClass = `badge-${req.status}`;
+                    let conexaoHtml = '';
                     
                     if(req.status === 'pendente' || req.status === 'desconectado' || req.status === 'recusado') {
                         botoes = `
@@ -267,13 +312,17 @@ HTML_ADMIN = """
                         `;
                     } else if(req.status === 'aprovado') {
                         botoes = `<button class="btn btn-red" onclick="fazerAcao('desconectar', '${mac}')">🛑 Desconectar Usuário</button>`;
+                        
+                        let stOnline = req.is_online ? '<span class="online">🟢 Online</span>' : '<span class="offline">🔴 Offline</span>';
+                        let timeText = req.time_left || '-';
+                        conexaoHtml = `<div class="conexao-info">${stOnline}<br><span class="tempo">⏳ Resta: ${timeText}</span></div>`;
                     }
                     
                     let tr = document.createElement('tr');
                     tr.innerHTML = `
                         <td><strong>${req.nome || 'Visitante'}</strong><br><span style="font-size:11px; color:#888;">${mac}</span></td>
                         <td>${req.ip || '-'}</td>
-                        <td><span class="status-badge ${statusClass}">${req.status.toUpperCase()}</span></td>
+                        <td><span class="status-badge ${statusClass}">${req.status.toUpperCase()}</span>${conexaoHtml}</td>
                         <td><div class="acoes">${botoes}</div></td>
                     `;
                     tbody.appendChild(tr);
@@ -304,7 +353,10 @@ def admin_acao():
             try:
                 if status_result == "aprovado":
                     markup_desc = InlineKeyboardMarkup()
-                    markup_desc.add(InlineKeyboardButton("🛑 Desconectar Usuário", callback_data=f"desconectar_{mac}"))
+                    markup_desc.add(
+                        InlineKeyboardButton("🛑 Desconectar Usuário", callback_data=f"desconectar_{mac}"),
+                        InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
+                    )
                     bot.edit_message_text(f"💻 *Aprovado via Painel Web:*\n\n{msg}", chat_id=ADMIN_CHAT_ID, message_id=msg_id, parse_mode="Markdown", reply_markup=markup_desc)
                 else:
                     bot.edit_message_text(f"💻 *Ação via Painel Web:*\n\n{msg}", chat_id=ADMIN_CHAT_ID, message_id=msg_id, parse_mode="Markdown")
@@ -317,12 +369,38 @@ def admin_acao():
 def callback_query(call):
     acao, mac = call.data.rsplit('_', 1)
     
+    # Adicionada regra específica para atualizar o status via Bot Telegram
+    if acao == "atualizar":
+        req = solicitacoes.get(mac)
+        if req and req.get("status") == "aprovado":
+            st_txt = "🟢 *Online*" if req.get("is_online") else "🔴 *Offline*"
+            tempo_txt = req.get("time_left", "N/A")
+            
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {req['nome']}\n*Usuário:* {req['user']}\n*MAC:* {mac}\n\n*Status Conexão:* {st_txt}\n*Tempo Restante:* {tempo_txt}"
+            
+            markup_desc = InlineKeyboardMarkup()
+            markup_desc.add(
+                InlineKeyboardButton("🛑 Desconectar", callback_data=f"desconectar_{mac}"),
+                InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
+            )
+            try:
+                bot.edit_message_text(msg, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=markup_desc)
+                bot.answer_callback_query(call.id, "Status atualizado com sucesso!")
+            except telebot.apihelper.ApiTelegramException:
+                bot.answer_callback_query(call.id, "O status já está atualizado.")
+        else:
+            bot.answer_callback_query(call.id, "Usuário não está mais aprovado ou não encontrado.")
+        return
+
     sucesso, status_result, msg = executar_acao(acao, mac)
 
     if sucesso:
         if status_result == "aprovado":
             markup_desc = InlineKeyboardMarkup()
-            markup_desc.add(InlineKeyboardButton("🛑 Desconectar Usuário", callback_data=f"desconectar_{mac}"))
+            markup_desc.add(
+                InlineKeyboardButton("🛑 Desconectar", callback_data=f"desconectar_{mac}"),
+                InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
+            )
             bot.edit_message_text(msg, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=markup_desc)
         else:
             bot.edit_message_text(msg, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown")
@@ -334,4 +412,5 @@ def iniciar_bot():
 
 if __name__ == '__main__':
     threading.Thread(target=iniciar_bot, daemon=True).start()
+    threading.Thread(target=monitorar_conexoes, daemon=True).start() # Inicia a thread que olha o tempo e status no MK
     app.run(host='0.0.0.0', port=5000)
