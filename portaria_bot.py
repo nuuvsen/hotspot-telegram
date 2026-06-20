@@ -38,10 +38,8 @@ def monitorar_conexoes():
                 
                 # Busca usuários ativos e todos os usuários cadastrados
                 usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
-                todos_usuarios = api.get_resource('/ip/hotspot/user').get()
                 
                 ativos_dict = {u.get('user'): u for u in usuarios_ativos}
-                users_dict = {u.get('name'): u for u in todos_usuarios}
 
                 for mac, dados in aprovados.items():
                     usuario = dados.get("user")
@@ -52,14 +50,7 @@ def monitorar_conexoes():
                         dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
                     else:
                         dados["is_online"] = False
-                        if usuario in users_dict:
-                            info_user = users_dict[usuario]
-                            if info_user.get("limit-uptime", "0s") == "0s":
-                                dados["time_left"] = "Ilimitado"
-                            else:
-                                dados["time_left"] = "Pausado (Offline)"
-                        else:
-                            dados["time_left"] = "Desconhecido"
+                        dados["time_left"] = "Offline"
                 
                 conexao.disconnect()
         except Exception as e:
@@ -75,12 +66,12 @@ def executar_acao(acao, mac):
     nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
-        # Agora definimos a variável 'perfil' dinamicamente com base na ação
-        if "10m" in acao: tempo = "00:10:00"; txt_tempo = "10 Minutos"; perfil = "10m"
-        elif "30m" in acao: tempo = "00:30:00"; txt_tempo = "30 Minutos"; perfil = "30m"
-        elif "1h" in acao: tempo = "01:00:00"; txt_tempo = "1 Hora"; perfil = "1h"
-        elif "5h" in acao: tempo = "05:00:00"; txt_tempo = "5 Horas"; perfil = "5h"
-        else: tempo = "ilimitado"; txt_tempo = "Tempo Ilimitado"; perfil = "ilimitado"
+        # Variável 'perfil' definida dinamicamente (tempo é controlado pelo Perfil do MK)
+        if "10m" in acao: txt_tempo = "10 Minutos"; perfil = "10m"
+        elif "30m" in acao: txt_tempo = "30 Minutos"; perfil = "30m"
+        elif "1h" in acao: txt_tempo = "1 Hora"; perfil = "1h"
+        elif "5h" in acao: txt_tempo = "5 Horas"; perfil = "5h"
+        else: txt_tempo = "Tempo Ilimitado"; perfil = "ilimitado"
         
         usuario_gerado = f"vis_{mac.replace(':', '')}"
         senha_gerada = gerar_senha()
@@ -89,19 +80,25 @@ def executar_acao(acao, mac):
             conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
             api = conexao.get_api()
             recurso_user = api.get_resource('/ip/hotspot/user')
+            recurso_host = api.get_resource('/ip/hotspot/host')
             
             usuarios_existentes = recurso_user.get(name=usuario_gerado)
             
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
-                'profile': perfil, # <--- AQUI: Usa o perfil correspondente ao tempo escolhido!
+                'profile': perfil,
                 'disabled': 'false',
                 'comment': f"Nome: {nome_cliente}"
             }
             
-            if tempo != "ilimitado": parametros_mk['limit-uptime'] = tempo
-            else: parametros_mk['limit-uptime'] = '0s'
+            # Captura o to-address para forçar a mudança de IP
+            hosts = recurso_host.get(mac_address=mac)
+            ip_entregue = None
+            if hosts:
+                ip_entregue = hosts[0].get('to-address')
+                if ip_entregue:
+                    parametros_mk['address'] = ip_entregue # Amarra o IP correto no cadastro do usuário
 
             if usuarios_existentes:
                 parametros_mk['id'] = usuarios_existentes[0]['id']
@@ -110,14 +107,23 @@ def executar_acao(acao, mac):
                 parametros_mk['name'] = usuario_gerado
                 recurso_user.add(**parametros_mk)
             
+            # Derruba a sessão ativa, se houver
             actives = api.get_resource('/ip/hotspot/active').get(mac_address=mac)
             for a in actives:
                 api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
+            # Derruba o registro na aba Hosts para forçar o dispositivo a renovar e assumir o to-address
+            for h in hosts:
+                try:
+                    recurso_host.remove(id=h['id'])
+                except Exception:
+                    pass
+
             conexao.disconnect()
 
             solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Perfil:* {perfil}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Perfil:* {perfil}\n*IP Forçado:* {ip_entregue or 'Não identificado'}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             return True, "aprovado", msg
 
         except Exception as e:
@@ -413,5 +419,5 @@ def iniciar_bot():
 
 if __name__ == '__main__':
     threading.Thread(target=iniciar_bot, daemon=True).start()
-    threading.Thread(target=monitorar_conexoes, daemon=True).start() # Inicia a thread que olha o tempo e status no MK
+    threading.Thread(target=monitorar_conexoes, daemon=True).start() 
     app.run(host='0.0.0.0', port=5000)
