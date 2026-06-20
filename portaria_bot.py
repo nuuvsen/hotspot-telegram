@@ -20,7 +20,6 @@ app = Flask(__name__)
 CORS(app)
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Armazena os dados em memória
 solicitacoes = {}
 
 def gerar_senha(tamanho=6):
@@ -31,6 +30,8 @@ def gerar_senha(tamanho=6):
 def executar_acao(acao, mac):
     if mac not in solicitacoes:
         return False, "nao_encontrado", "Solicitação não encontrada."
+
+    nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
         if "10m" in acao: tempo = "00:10:00"; txt_tempo = "10 Minutos"
@@ -49,11 +50,13 @@ def executar_acao(acao, mac):
             
             usuarios_existentes = recurso_user.get(name=usuario_gerado)
             
+            # Adiciona o Comentário com o nome do cliente!
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
                 'profile': 'convidado',
-                'disabled': 'false'
+                'disabled': 'false',
+                'comment': f"Nome: {nome_cliente}"
             }
             
             if tempo != "ilimitado": parametros_mk['limit-uptime'] = tempo
@@ -73,7 +76,7 @@ def executar_acao(acao, mac):
             conexao.disconnect()
 
             solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada})
-            msg = f"✅ *Acesso Aprovado!*\n\n*Tempo:* {txt_tempo}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             return True, "aprovado", msg
 
         except Exception as e:
@@ -81,7 +84,7 @@ def executar_acao(acao, mac):
 
     elif acao == "recusar":
         solicitacoes[mac]["status"] = "recusado"
-        return True, "recusado", f"🚫 *Acesso Recusado*\n\n*MAC:* {mac}"
+        return True, "recusado", f"🚫 *Acesso Recusado*\n\n*Nome:* {nome_cliente}\n*MAC:* {mac}"
 
     elif acao == "desconectar":
         usuario_gerado = f"vis_{mac.replace(':', '')}"
@@ -99,7 +102,7 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
             solicitacoes[mac]["status"] = "desconectado"
-            return True, "desconectado", f"🛑 *Usuário Desconectado!*\n\nA conexão de {usuario_gerado} foi encerrada."
+            return True, "desconectado", f"🛑 *Usuário Desconectado!*\n\nA conexão de {nome_cliente} ({usuario_gerado}) foi encerrada."
             
         except Exception as e:
             return False, "erro", f"Erro ao desconectar no MikroTik: {e}"
@@ -112,6 +115,8 @@ def solicitar():
     dados = request.json
     mac = dados.get('mac')
     ip = dados.get('ip')
+    nome = dados.get('nome', 'Visitante Sem Nome').strip()
+    if not nome: nome = 'Visitante Sem Nome'
 
     if not mac: return jsonify({"erro": "MAC ausente"}), 400
 
@@ -120,13 +125,12 @@ def solicitar():
     markup.row(InlineKeyboardButton("⏳ 1 Hora", callback_data=f"aceitar_1h_{mac}"), InlineKeyboardButton("⏳ 5 Horas", callback_data=f"aceitar_5h_{mac}"))
     markup.row(InlineKeyboardButton("♾️ Ilimitado", callback_data=f"aceitar_ilim_{mac}"), InlineKeyboardButton("❌ Recusar", callback_data=f"recusar_{mac}"))
     
-    mensagem = f"🔔 *NOVA SOLICITAÇÃO DE ACESSO*\n\n*IP:* {ip}\n*MAC:* {mac}\n\nEscolha o tempo de liberação:"
+    mensagem = f"🔔 *NOVA SOLICITAÇÃO DE ACESSO*\n\n*Nome:* {nome}\n*IP:* {ip}\n*MAC:* {mac}\n\nEscolha o tempo de liberação:"
     
-    # Envia para o telegram e GUARDA o ID da mensagem para podermos editar depois!
     msg_enviada = bot.send_message(ADMIN_CHAT_ID, mensagem, parse_mode="Markdown", reply_markup=markup)
     
     solicitacoes[mac] = {
-        "status": "pendente", "user": "", "password": "", "ip": ip, "message_id": msg_enviada.message_id
+        "status": "pendente", "user": "", "password": "", "ip": ip, "nome": nome, "message_id": msg_enviada.message_id
     }
 
     return jsonify({"message": "Solicitação enviada"}), 200
@@ -139,7 +143,6 @@ def status():
 
 @app.route('/admin/dados', methods=['GET'])
 def admin_dados():
-    # Rota invisível que fornece dados em tempo real para o painel JS
     return jsonify(solicitacoes)
 
 
@@ -158,7 +161,6 @@ HTML_ADMIN = """
         .container { max-width: 1000px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
         h2 { text-align: center; color: #2563eb; margin-top: 0; }
         
-        /* Notificação Toast */
         #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 5px; padding: 16px; position: fixed; z-index: 1; right: 20px; top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: 0.3s; }
         #toast.show { visibility: visible; }
         #toast.success { background-color: #10b981; }
@@ -196,7 +198,7 @@ HTML_ADMIN = """
         <table id="tabela-solicitacoes">
             <thead>
                 <tr>
-                    <th>MAC Address</th>
+                    <th>Visitante / MAC</th>
                     <th>IP</th>
                     <th>Status</th>
                     <th>Ações Rápidas</th>
@@ -209,7 +211,6 @@ HTML_ADMIN = """
     </div>
 
     <script>
-        // Função para mostrar notificação chique na tela
         function showToast(msg, tipo) {
             const toast = document.getElementById("toast");
             toast.className = "show " + tipo;
@@ -217,9 +218,7 @@ HTML_ADMIN = """
             setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
         }
 
-        // Função que envia a ação silenciosamente
         function fazerAcao(acao, mac) {
-            // Desativa botões para evitar duplo clique
             event.target.innerText = "Processando...";
             event.target.style.opacity = "0.5";
 
@@ -232,7 +231,7 @@ HTML_ADMIN = """
             .then(data => {
                 if(data.sucesso) {
                     showToast("Ação realizada com sucesso!", "success");
-                    carregarDados(); // Força atualização imediata da tabela
+                    carregarDados();
                 } else {
                     showToast("Erro: " + data.mensagem, "error");
                     carregarDados();
@@ -240,7 +239,6 @@ HTML_ADMIN = """
             });
         }
 
-        // Função mágica que carrega os dados em tempo real sem recarregar a tela
         function carregarDados() {
             fetch('/admin/dados')
             .then(res => res.json())
@@ -274,7 +272,7 @@ HTML_ADMIN = """
                     
                     let tr = document.createElement('tr');
                     tr.innerHTML = `
-                        <td><strong>${mac}</strong><br><span style="font-size:11px; color:#888;">${req.user || ''}</span></td>
+                        <td><strong>${req.nome || 'Visitante'}</strong><br><span style="font-size:11px; color:#888;">${mac}</span></td>
                         <td>${req.ip || '-'}</td>
                         <td><span class="status-badge ${statusClass}">${req.status.toUpperCase()}</span></td>
                         <td><div class="acoes">${botoes}</div></td>
@@ -284,9 +282,7 @@ HTML_ADMIN = """
             });
         }
 
-        // Atualiza a tabela a cada 3 segundos infinitamente
         setInterval(carregarDados, 3000);
-        // Carrega imediatamente ao abrir a página
         window.onload = carregarDados;
     </script>
 </body>
@@ -303,12 +299,10 @@ def admin_acao():
     mac = dados.get('mac')
     sucesso, status_result, msg = executar_acao(dados.get('acao'), mac)
     
-    # === A MÁGICA DE SINCRONIZAR COM O TELEGRAM ===
     if sucesso and mac in solicitacoes:
         msg_id = solicitacoes[mac].get("message_id")
         if msg_id:
             try:
-                # Se aprovou pelo painel web, atualiza a mensagem antiga lá no Telegram
                 if status_result == "aprovado":
                     markup_desc = InlineKeyboardMarkup()
                     markup_desc.add(InlineKeyboardButton("🛑 Desconectar Usuário", callback_data=f"desconectar_{mac}"))
@@ -316,12 +310,9 @@ def admin_acao():
                 else:
                     bot.edit_message_text(f"💻 *Ação via Painel Web:*\n\n{msg}", chat_id=ADMIN_CHAT_ID, message_id=msg_id, parse_mode="Markdown")
             except Exception as e:
-                pass # Ignora erro se a mensagem já foi apagada do telegram
+                pass 
 
     return jsonify({"sucesso": sucesso, "mensagem": msg})
-
-
-# === AÇÕES CLICADAS DIRETAMENTE NO TELEGRAM ===
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
