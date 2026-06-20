@@ -34,11 +34,12 @@ def executar_acao(acao, mac):
     nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
-        if "10m" in acao: tempo = "00:10:00"; txt_tempo = "10 Minutos"
-        elif "30m" in acao: tempo = "00:30:00"; txt_tempo = "30 Minutos"
-        elif "1h" in acao: tempo = "01:00:00"; txt_tempo = "1 Hora"
-        elif "5h" in acao: tempo = "05:00:00"; txt_tempo = "5 Horas"
-        else: tempo = "ilimitado"; txt_tempo = "Tempo Ilimitado"
+        # ATENÇÃO: Os nomes abaixo (profile_mk) devem ser IGUAIS aos do seu MikroTik
+        if "10m" in acao: profile_mk = "10m"; txt_tempo = "10 Minutos"
+        elif "30m" in acao: profile_mk = "30m"; txt_tempo = "30 Minutos"
+        elif "1h" in acao: profile_mk = "1h"; txt_tempo = "1 Hora"
+        elif "5h" in acao: profile_mk = "5h"; txt_tempo = "5 Horas"
+        else: profile_mk = "Ilimitado"; txt_tempo = "Tempo Ilimitado"
         
         usuario_gerado = f"vis_{mac.replace(':', '')}"
         senha_gerada = gerar_senha()
@@ -50,17 +51,15 @@ def executar_acao(acao, mac):
             
             usuarios_existentes = recurso_user.get(name=usuario_gerado)
             
-            # Adiciona o Comentário com o nome do cliente!
+            # Agora injetamos o PROFILE dinâmico e tiramos o limit-uptime individual
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
-                'profile': 'convidado',
+                'profile': profile_mk,
                 'disabled': 'false',
-                'comment': f"Nome: {nome_cliente}"
+                'comment': f"Nome: {nome_cliente}",
+                'limit-uptime': '0s' # Zera o limite local do usuário para que o Profile comande as regras
             }
-            
-            if tempo != "ilimitado": parametros_mk['limit-uptime'] = tempo
-            else: parametros_mk['limit-uptime'] = '0s'
 
             if usuarios_existentes:
                 parametros_mk['id'] = usuarios_existentes[0]['id']
@@ -76,7 +75,7 @@ def executar_acao(acao, mac):
             conexao.disconnect()
 
             solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada})
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Plano/Profile:* {profile_mk}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             return True, "aprovado", msg
 
         except Exception as e:
