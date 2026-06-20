@@ -26,7 +26,7 @@ solicitacoes = {}
 def gerar_senha(tamanho=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=tamanho))
 
-# === MOTOR DE AÇÕES (Usado pelo Telegram e pelo Painel Web) ===
+# === MOTOR DE AÇÕES ===
 
 def executar_acao(acao, mac):
     if mac not in solicitacoes:
@@ -39,7 +39,6 @@ def executar_acao(acao, mac):
         elif "5h" in acao: tempo = "05:00:00"; txt_tempo = "5 Horas"
         else: tempo = "ilimitado"; txt_tempo = "Tempo Ilimitado"
         
-        # Cria um usuário fixo baseado no MAC (Evita duplicações no Mikrotik)
         usuario_gerado = f"vis_{mac.replace(':', '')}"
         senha_gerada = gerar_senha()
 
@@ -48,32 +47,25 @@ def executar_acao(acao, mac):
             api = conexao.get_api()
             recurso_user = api.get_resource('/ip/hotspot/user')
             
-            # Verifica se o usuário já existe
             usuarios_existentes = recurso_user.get(name=usuario_gerado)
             
-            # ATENÇÃO: O profile 'convidado' deve existir no MikroTik!
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
                 'profile': 'convidado',
-                'disabled': 'false' # Reativa caso estivesse desconectado
+                'disabled': 'false'
             }
             
-            if tempo != "ilimitado":
-                parametros_mk['limit-uptime'] = tempo
-            else:
-                parametros_mk['limit-uptime'] = '0s' # 0s limpa o limite de tempo no mikrotik
+            if tempo != "ilimitado": parametros_mk['limit-uptime'] = tempo
+            else: parametros_mk['limit-uptime'] = '0s'
 
             if usuarios_existentes:
-                # Se existir, APENAS ATUALIZA
                 parametros_mk['id'] = usuarios_existentes[0]['id']
                 recurso_user.set(**parametros_mk)
             else:
-                # Se não existir, CRIA UM NOVO
                 parametros_mk['name'] = usuario_gerado
                 recurso_user.add(**parametros_mk)
             
-            # Se o usuário estava online na tela de bloqueio, derruba para logar com o novo tempo
             actives = api.get_resource('/ip/hotspot/active').get(mac_address=mac)
             for a in actives:
                 api.get_resource('/ip/hotspot/active').remove(id=a['id'])
@@ -97,12 +89,10 @@ def executar_acao(acao, mac):
             conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
             api = conexao.get_api()
             
-            # 1. Desativa o usuário para não logar de novo sozinho
             users = api.get_resource('/ip/hotspot/user').get(name=usuario_gerado)
             for u in users:
                 api.get_resource('/ip/hotspot/user').set(id=u['id'], disabled='true')
             
-            # 2. Derruba a conexão ativa na hora
             actives = api.get_resource('/ip/hotspot/active').get(user=usuario_gerado)
             for a in actives:
                 api.get_resource('/ip/hotspot/active').remove(id=a['id'])
@@ -115,7 +105,7 @@ def executar_acao(acao, mac):
             return False, "erro", f"Erro ao desconectar no MikroTik: {e}"
 
 
-# === ROTAS DA API HOTSPOT ===
+# === ROTAS DA API HOTSPOT E TELEGRAM ===
 
 @app.route('/solicitar', methods=['POST'])
 def solicitar():
@@ -125,15 +115,19 @@ def solicitar():
 
     if not mac: return jsonify({"erro": "MAC ausente"}), 400
 
-    solicitacoes[mac] = {"status": "pendente", "user": "", "password": "", "ip": ip}
-
     markup = InlineKeyboardMarkup()
     markup.row(InlineKeyboardButton("⏱ 10 Min", callback_data=f"aceitar_10m_{mac}"), InlineKeyboardButton("⏱ 30 Min", callback_data=f"aceitar_30m_{mac}"))
     markup.row(InlineKeyboardButton("⏳ 1 Hora", callback_data=f"aceitar_1h_{mac}"), InlineKeyboardButton("⏳ 5 Horas", callback_data=f"aceitar_5h_{mac}"))
     markup.row(InlineKeyboardButton("♾️ Ilimitado", callback_data=f"aceitar_ilim_{mac}"), InlineKeyboardButton("❌ Recusar", callback_data=f"recusar_{mac}"))
     
     mensagem = f"🔔 *NOVA SOLICITAÇÃO DE ACESSO*\n\n*IP:* {ip}\n*MAC:* {mac}\n\nEscolha o tempo de liberação:"
-    bot.send_message(ADMIN_CHAT_ID, mensagem, parse_mode="Markdown", reply_markup=markup)
+    
+    # Envia para o telegram e GUARDA o ID da mensagem para podermos editar depois!
+    msg_enviada = bot.send_message(ADMIN_CHAT_ID, mensagem, parse_mode="Markdown", reply_markup=markup)
+    
+    solicitacoes[mac] = {
+        "status": "pendente", "user": "", "password": "", "ip": ip, "message_id": msg_enviada.message_id
+    }
 
     return jsonify({"message": "Solicitação enviada"}), 200
 
@@ -143,77 +137,92 @@ def status():
     if mac in solicitacoes: return jsonify(solicitacoes[mac]), 200
     return jsonify({"status": "nao_encontrado"}), 404
 
+@app.route('/admin/dados', methods=['GET'])
+def admin_dados():
+    # Rota invisível que fornece dados em tempo real para o painel JS
+    return jsonify(solicitacoes)
 
-# === PAINEL DE GERÊNCIA WEB ===
+
+# === PAINEL DE GERÊNCIA WEB AVANÇADO ===
 
 HTML_ADMIN = """
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="UTF-8">
-    <title>Gerência Nuuvsen</title>
+    <title>Painel Pro - Nuuvsen Hotspot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body { font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 20px; color: #333; }
-        .container { max-width: 900px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        h2 { text-align: center; color: #3b82f6; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; }
-        th, td { padding: 12px; border: 1px solid #ddd; text-align: center; vertical-align: middle; }
-        th { background-color: #3b82f6; color: white; }
-        .pendente { color: #f59e0b; font-weight: bold; }
-        .aprovado { color: #10b981; font-weight: bold; }
-        .recusado, .desconectado { color: #ef4444; font-weight: bold; }
+        * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { background-color: #eef2f5; padding: 20px; color: #333; margin: 0; }
+        .container { max-width: 1000px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
+        h2 { text-align: center; color: #2563eb; margin-top: 0; }
         
-        .btn { padding: 6px 10px; margin: 2px; border: none; border-radius: 4px; cursor: pointer; color: white; font-weight: bold; font-size: 12px; }
-        .btn-green { background-color: #10b981; }
-        .btn-green:hover { background-color: #059669; }
-        .btn-blue { background-color: #3b82f6; }
-        .btn-blue:hover { background-color: #2563eb; }
-        .btn-red { background-color: #ef4444; }
-        .btn-red:hover { background-color: #dc2626; }
-        .acoes { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; }
+        /* Notificação Toast */
+        #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 5px; padding: 16px; position: fixed; z-index: 1; right: 20px; top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: 0.3s; }
+        #toast.show { visibility: visible; }
+        #toast.success { background-color: #10b981; }
+        #toast.error { background-color: #ef4444; }
+
+        .status-badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; color: white; display: inline-block; }
+        .badge-pendente { background-color: #f59e0b; }
+        .badge-aprovado { background-color: #10b981; }
+        .badge-recusado, .badge-desconectado { background-color: #ef4444; }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
+        th, td { padding: 15px 10px; border-bottom: 1px solid #eee; text-align: center; vertical-align: middle; }
+        th { background-color: #f8fafc; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        tr:hover { background-color: #f8fafc; }
+        
+        .btn { padding: 8px 12px; margin: 3px; border: none; border-radius: 6px; cursor: pointer; color: white; font-weight: 600; font-size: 12px; transition: 0.2s; }
+        .btn-green { background-color: #10b981; } .btn-green:hover { background-color: #059669; }
+        .btn-blue { background-color: #3b82f6; } .btn-blue:hover { background-color: #2563eb; }
+        .btn-red { background-color: #ef4444; } .btn-red:hover { background-color: #dc2626; }
+        .acoes { display: flex; flex-wrap: wrap; justify-content: center; gap: 5px; }
+        
+        .live-indicator { display: inline-block; width: 8px; height: 8px; background-color: #10b981; border-radius: 50%; margin-right: 5px; animation: blink 1.5s infinite; }
+        @keyframes blink { 0% {opacity: 1;} 50% {opacity: 0.4;} 100% {opacity: 1;} }
     </style>
 </head>
 <body>
+    <div id="toast">Notificação</div>
+
     <div class="container">
-        <h2>Painel de Gerência - Nuuvsen Hotspot</h2>
-        <button onclick="location.reload()" style="padding: 8px; margin-bottom: 10px; cursor:pointer;">🔄 Atualizar Tela</button>
-        <table>
-            <tr>
-                <th>MAC do Cliente</th>
-                <th>IP</th>
-                <th>Status</th>
-                <th>Ações Rápida</th>
-            </tr>
-            {% for mac, dados in solicitacoes.items() %}
-            <tr>
-                <td>{{ mac }}</td>
-                <td>{{ dados.ip or '-' }}</td>
-                <td class="{{ dados.status }}">{{ dados.status | upper }}</td>
-                <td>
-                    {% if dados.status == 'pendente' or dados.status == 'desconectado' or dados.status == 'recusado' %}
-                        <div class="acoes">
-                            <button class="btn btn-green" onclick="fazerAcao('aceitar_10m', '{{ mac }}')">10m</button>
-                            <button class="btn btn-green" onclick="fazerAcao('aceitar_30m', '{{ mac }}')">30m</button>
-                            <button class="btn btn-green" onclick="fazerAcao('aceitar_1h', '{{ mac }}')">1h</button>
-                            <button class="btn btn-green" onclick="fazerAcao('aceitar_5h', '{{ mac }}')">5h</button>
-                            <button class="btn btn-blue" onclick="fazerAcao('aceitar_ilim', '{{ mac }}')">Ilim.</button>
-                            <button class="btn btn-red" onclick="fazerAcao('recusar', '{{ mac }}')">Recusar</button>
-                        </div>
-                    {% elif dados.status == 'aprovado' %}
-                        <div class="acoes">
-                            <button class="btn btn-red" onclick="fazerAcao('desconectar', '{{ mac }}')">🛑 Desconectar</button>
-                        </div>
-                    {% endif %}
-                </td>
-            </tr>
-            {% else %}
-            <tr><td colspan="4">Nenhuma solicitação registrada na memória.</td></tr>
-            {% endfor %}
+        <h2>Painel de Gerência Hotspot</h2>
+        <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
+            <span class="live-indicator"></span> Sincronizado em tempo real com o Telegram
+        </div>
+        
+        <table id="tabela-solicitacoes">
+            <thead>
+                <tr>
+                    <th>MAC Address</th>
+                    <th>IP</th>
+                    <th>Status</th>
+                    <th>Ações Rápidas</th>
+                </tr>
+            </thead>
+            <tbody id="tabela-corpo">
+                <tr><td colspan="4">Carregando dados...</td></tr>
+            </tbody>
         </table>
     </div>
 
     <script>
+        // Função para mostrar notificação chique na tela
+        function showToast(msg, tipo) {
+            const toast = document.getElementById("toast");
+            toast.className = "show " + tipo;
+            toast.innerText = msg;
+            setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
+        }
+
+        // Função que envia a ação silenciosamente
         function fazerAcao(acao, mac) {
+            // Desativa botões para evitar duplo clique
+            event.target.innerText = "Processando...";
+            event.target.style.opacity = "0.5";
+
             fetch('/admin/acao', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -222,12 +231,63 @@ HTML_ADMIN = """
             .then(res => res.json())
             .then(data => {
                 if(data.sucesso) {
-                    location.reload();
+                    showToast("Ação realizada com sucesso!", "success");
+                    carregarDados(); // Força atualização imediata da tabela
                 } else {
-                    alert("Erro: " + data.mensagem);
+                    showToast("Erro: " + data.mensagem, "error");
+                    carregarDados();
                 }
             });
         }
+
+        // Função mágica que carrega os dados em tempo real sem recarregar a tela
+        function carregarDados() {
+            fetch('/admin/dados')
+            .then(res => res.json())
+            .then(data => {
+                const tbody = document.getElementById('tabela-corpo');
+                tbody.innerHTML = '';
+                const macs = Object.keys(data);
+                
+                if(macs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="color:#94a3b8; padding:30px;">Nenhum dispositivo registrado ainda.</td></tr>';
+                    return;
+                }
+                
+                macs.forEach(mac => {
+                    const req = data[mac];
+                    let botoes = '';
+                    let statusClass = `badge-${req.status}`;
+                    
+                    if(req.status === 'pendente' || req.status === 'desconectado' || req.status === 'recusado') {
+                        botoes = `
+                            <button class="btn btn-green" onclick="fazerAcao('aceitar_10m', '${mac}')">10m</button>
+                            <button class="btn btn-green" onclick="fazerAcao('aceitar_30m', '${mac}')">30m</button>
+                            <button class="btn btn-green" onclick="fazerAcao('aceitar_1h', '${mac}')">1h</button>
+                            <button class="btn btn-green" onclick="fazerAcao('aceitar_5h', '${mac}')">5h</button>
+                            <button class="btn btn-blue" onclick="fazerAcao('aceitar_ilim', '${mac}')">Ilim.</button>
+                            <button class="btn btn-red" onclick="fazerAcao('recusar', '${mac}')">Recusar</button>
+                        `;
+                    } else if(req.status === 'aprovado') {
+                        botoes = `<button class="btn btn-red" onclick="fazerAcao('desconectar', '${mac}')">🛑 Desconectar Usuário</button>`;
+                    }
+                    
+                    let tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td><strong>${mac}</strong><br><span style="font-size:11px; color:#888;">${req.user || ''}</span></td>
+                        <td>${req.ip || '-'}</td>
+                        <td><span class="status-badge ${statusClass}">${req.status.toUpperCase()}</span></td>
+                        <td><div class="acoes">${botoes}</div></td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            });
+        }
+
+        // Atualiza a tabela a cada 3 segundos infinitamente
+        setInterval(carregarDados, 3000);
+        // Carrega imediatamente ao abrir a página
+        window.onload = carregarDados;
     </script>
 </body>
 </html>
@@ -235,21 +295,33 @@ HTML_ADMIN = """
 
 @app.route('/admin')
 def admin():
-    return render_template_string(HTML_ADMIN, solicitacoes=solicitacoes)
+    return render_template_string(HTML_ADMIN)
 
 @app.route('/admin/acao', methods=['POST'])
 def admin_acao():
     dados = request.json
-    sucesso, status_result, msg = executar_acao(dados.get('acao'), dados.get('mac'))
+    mac = dados.get('mac')
+    sucesso, status_result, msg = executar_acao(dados.get('acao'), mac)
     
-    # Se fez a ação pelo painel, notifica no Telegram para manter o histórico
-    if sucesso:
-        bot.send_message(ADMIN_CHAT_ID, f"💻 *Ação via Painel Web:*\n{msg}", parse_mode="Markdown")
+    # === A MÁGICA DE SINCRONIZAR COM O TELEGRAM ===
+    if sucesso and mac in solicitacoes:
+        msg_id = solicitacoes[mac].get("message_id")
+        if msg_id:
+            try:
+                # Se aprovou pelo painel web, atualiza a mensagem antiga lá no Telegram
+                if status_result == "aprovado":
+                    markup_desc = InlineKeyboardMarkup()
+                    markup_desc.add(InlineKeyboardButton("🛑 Desconectar Usuário", callback_data=f"desconectar_{mac}"))
+                    bot.edit_message_text(f"💻 *Aprovado via Painel Web:*\n\n{msg}", chat_id=ADMIN_CHAT_ID, message_id=msg_id, parse_mode="Markdown", reply_markup=markup_desc)
+                else:
+                    bot.edit_message_text(f"💻 *Ação via Painel Web:*\n\n{msg}", chat_id=ADMIN_CHAT_ID, message_id=msg_id, parse_mode="Markdown")
+            except Exception as e:
+                pass # Ignora erro se a mensagem já foi apagada do telegram
 
     return jsonify({"sucesso": sucesso, "mensagem": msg})
 
 
-# === AÇÕES DO TELEGRAM ===
+# === AÇÕES CLICADAS DIRETAMENTE NO TELEGRAM ===
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
