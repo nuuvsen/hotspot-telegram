@@ -29,16 +29,13 @@ def gerar_senha(tamanho=6):
 def monitorar_conexoes():
     while True:
         try:
-            # Filtra apenas os usuários que estão aprovados
             aprovados = {mac: dados for mac, dados in solicitacoes.items() if dados.get("status") == "aprovado"}
             
             if aprovados:
                 conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
                 api = conexao.get_api()
                 
-                # Busca usuários ativos e todos os usuários cadastrados
                 usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
-                
                 ativos_dict = {u.get('user'): u for u in usuarios_ativos}
 
                 for mac, dados in aprovados.items():
@@ -54,19 +51,21 @@ def monitorar_conexoes():
                 
                 conexao.disconnect()
         except Exception as e:
-            print(f"Erro no monitoramento do MikroTik: {e}")
+            print(f"Erro no monitoramento: {e}")
         
-        time.sleep(10) # Atualiza a cada 10 segundos
+        time.sleep(10)
 
 # === MOTOR DE AÇÕES ===
 def executar_acao(acao, mac):
+    # Padroniza o MAC para maiúsculo para garantir a busca correta no MK
+    mac = mac.upper() 
+    
     if mac not in solicitacoes:
         return False, "nao_encontrado", "Solicitação não encontrada."
 
     nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
-        # Variável 'perfil' definida dinamicamente (tempo é controlado pelo Perfil do MK)
         if "10m" in acao: txt_tempo = "10 Minutos"; perfil = "10m"
         elif "30m" in acao: txt_tempo = "30 Minutos"; perfil = "30m"
         elif "1h" in acao: txt_tempo = "1 Hora"; perfil = "1h"
@@ -82,8 +81,15 @@ def executar_acao(acao, mac):
             recurso_user = api.get_resource('/ip/hotspot/user')
             recurso_host = api.get_resource('/ip/hotspot/host')
             
-            usuarios_existentes = recurso_user.get(name=usuario_gerado)
+            # 1. BUSCA O TO-ADDRESS DE FORMA GARANTIDA (Pega todos os hosts e compara o MAC manualmente)
+            todos_hosts = recurso_host.get()
+            ip_entregue = None
+            for h in todos_hosts:
+                if h.get('mac-address', '').upper() == mac:
+                    ip_entregue = h.get('to-address')
+                    break
             
+            # 2. CONFIGURA O USUÁRIO
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
@@ -92,14 +98,12 @@ def executar_acao(acao, mac):
                 'comment': f"Nome: {nome_cliente}"
             }
             
-            # Captura o to-address para forçar a mudança de IP
-            hosts = recurso_host.get(mac_address=mac)
-            ip_entregue = None
-            if hosts:
-                ip_entregue = hosts[0].get('to-address')
-                if ip_entregue:
-                    parametros_mk['address'] = ip_entregue # Amarra o IP correto no cadastro do usuário
+            # SE ENCONTROU O TO-ADDRESS, AMARRA NO ADDRESS DO USUÁRIO
+            if ip_entregue:
+                parametros_mk['address'] = ip_entregue 
 
+            usuarios_existentes = recurso_user.get(name=usuario_gerado)
+            
             if usuarios_existentes:
                 parametros_mk['id'] = usuarios_existentes[0]['id']
                 recurso_user.set(**parametros_mk)
@@ -107,23 +111,36 @@ def executar_acao(acao, mac):
                 parametros_mk['name'] = usuario_gerado
                 recurso_user.add(**parametros_mk)
             
-            # Derruba a sessão ativa, se houver
-            actives = api.get_resource('/ip/hotspot/active').get(mac_address=mac)
+            # 3. DERRUBA TUDO PARA FORÇAR A TROCA DO IP NO APARELHO
+            
+            # A) Derruba o usuário do Active (se existir)
+            actives = api.get_resource('/ip/hotspot/active').get()
             for a in actives:
-                api.get_resource('/ip/hotspot/active').remove(id=a['id'])
+                if a.get('mac-address', '').upper() == mac:
+                    api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
-            # Derruba o registro na aba Hosts para forçar o dispositivo a renovar e assumir o to-address
-            for h in hosts:
-                try:
-                    recurso_host.remove(id=h['id'])
-                except Exception:
-                    pass
+            # B) Derruba o dispositivo da aba Host
+            for h in todos_hosts:
+                if h.get('mac-address', '').upper() == mac:
+                    try:
+                        recurso_host.remove(id=h['id'])
+                    except: pass
+            
+            # C) Derruba o IP antigo do servidor DHCP (Isso obriga o celular a pegar a configuração nova)
+            try:
+                recurso_dhcp = api.get_resource('/ip/dhcp-server/lease')
+                leases = recurso_dhcp.get()
+                for l in leases:
+                    if l.get('mac-address', '').upper() == mac:
+                        recurso_dhcp.remove(id=l['id'])
+            except Exception:
+                pass # Ignora se falhar ao derrubar do DHCP, não vai quebrar o script
 
             conexao.disconnect()
 
             solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
             
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Perfil:* {perfil}\n*IP Forçado:* {ip_entregue or 'Não identificado'}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Perfil:* {perfil}\n*IP Atribuído:* `{ip_entregue or 'Aguardando Dispositivo...'}`\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             return True, "aprovado", msg
 
         except Exception as e:
@@ -135,6 +152,7 @@ def executar_acao(acao, mac):
 
     elif acao == "desconectar":
         usuario_gerado = f"vis_{mac.replace(':', '')}"
+        mac_cliente = mac.upper()
         try:
             conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
             api = conexao.get_api()
@@ -143,22 +161,23 @@ def executar_acao(acao, mac):
             for u in users:
                 api.get_resource('/ip/hotspot/user').set(id=u['id'], disabled='true')
             
-            actives = api.get_resource('/ip/hotspot/active').get(user=usuario_gerado)
+            actives = api.get_resource('/ip/hotspot/active').get()
             for a in actives:
-                api.get_resource('/ip/hotspot/active').remove(id=a['id'])
+                if a.get('mac-address', '').upper() == mac_cliente or a.get('user') == usuario_gerado:
+                    api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
             conexao.disconnect()
             solicitacoes[mac].update({"status": "desconectado", "is_online": False, "time_left": "-"})
             return True, "desconectado", f"🛑 *Usuário Desconectado!*\n\nA conexão de {nome_cliente} ({usuario_gerado}) foi encerrada."
             
         except Exception as e:
-            return False, "erro", f"Erro ao desconectar no MikroTik: {e}"
+            return False, "erro", f"Erro ao desconectar: {e}"
 
 # === ROTAS DA API HOTSPOT E TELEGRAM ===
 @app.route('/solicitar', methods=['POST'])
 def solicitar():
     dados = request.json
-    mac = dados.get('mac')
+    mac = dados.get('mac', '').upper() # Já garante que o MAC entra padronizado
     ip = dados.get('ip')
     nome = dados.get('nome', 'Visitante Sem Nome').strip()
     if not nome: nome = 'Visitante Sem Nome'
@@ -170,7 +189,7 @@ def solicitar():
     markup.row(InlineKeyboardButton("⏳ 1 Hora", callback_data=f"aceitar_1h_{mac}"), InlineKeyboardButton("⏳ 5 Horas", callback_data=f"aceitar_5h_{mac}"))
     markup.row(InlineKeyboardButton("♾️ Ilimitado", callback_data=f"aceitar_ilim_{mac}"), InlineKeyboardButton("❌ Recusar", callback_data=f"recusar_{mac}"))
     
-    mensagem = f"🔔 *NOVA SOLICITAÇÃO DE ACESSO*\n\n*Nome:* {nome}\n*IP:* {ip}\n*MAC:* {mac}\n\nEscolha o tempo de liberação:"
+    mensagem = f"🔔 *NOVA SOLICITAÇÃO DE ACESSO*\n\n*Nome:* {nome}\n*IP Solicitante:* {ip}\n*MAC:* {mac}\n\nEscolha o tempo de liberação:"
     
     msg_enviada = bot.send_message(ADMIN_CHAT_ID, mensagem, parse_mode="Markdown", reply_markup=markup)
     
@@ -183,7 +202,7 @@ def solicitar():
 
 @app.route('/status', methods=['GET'])
 def status():
-    mac = request.args.get('mac')
+    mac = request.args.get('mac', '').upper()
     if mac in solicitacoes: return jsonify(solicitacoes[mac]), 200
     return jsonify({"status": "nao_encontrado"}), 404
 
@@ -376,7 +395,6 @@ def admin_acao():
 def callback_query(call):
     acao, mac = call.data.rsplit('_', 1)
     
-    # Adicionada regra específica para atualizar o status via Bot Telegram
     if acao == "atualizar":
         req = solicitacoes.get(mac)
         if req and req.get("status") == "aprovado":
