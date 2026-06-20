@@ -1,0 +1,4 @@
+flask
+flask-cors
+pyTelegramBotAPI
+routeros_api
