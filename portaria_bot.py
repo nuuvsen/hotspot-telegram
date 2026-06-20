@@ -81,15 +81,7 @@ def executar_acao(acao, mac):
             recurso_user = api.get_resource('/ip/hotspot/user')
             recurso_host = api.get_resource('/ip/hotspot/host')
             
-            # 1. BUSCA O TO-ADDRESS DE FORMA GARANTIDA (Pega todos os hosts e compara o MAC manualmente)
-            todos_hosts = recurso_host.get()
-            ip_entregue = None
-            for h in todos_hosts:
-                if h.get('mac-address', '').upper() == mac:
-                    ip_entregue = h.get('to-address')
-                    break
-            
-            # 2. CONFIGURA O USUÁRIO
+            # 1. CONFIGURA O USUÁRIO (Sem forçar o 'address'. O MikroTik dará o IP da Pool do Perfil)
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
@@ -98,10 +90,6 @@ def executar_acao(acao, mac):
                 'comment': f"Nome: {nome_cliente}"
             }
             
-            # SE ENCONTROU O TO-ADDRESS, AMARRA NO ADDRESS DO USUÁRIO
-            if ip_entregue:
-                parametros_mk['address'] = ip_entregue 
-
             usuarios_existentes = recurso_user.get(name=usuario_gerado)
             
             if usuarios_existentes:
@@ -111,7 +99,7 @@ def executar_acao(acao, mac):
                 parametros_mk['name'] = usuario_gerado
                 recurso_user.add(**parametros_mk)
             
-            # 3. DERRUBA TUDO PARA FORÇAR A TROCA DO IP NO APARELHO
+            # 2. DERRUBA TUDO PARA FORÇAR A TROCA DO IP E DA POOL NO APARELHO
             
             # A) Derruba o usuário do Active (se existir)
             actives = api.get_resource('/ip/hotspot/active').get()
@@ -120,27 +108,29 @@ def executar_acao(acao, mac):
                     api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
             # B) Derruba o dispositivo da aba Host
+            todos_hosts = recurso_host.get()
             for h in todos_hosts:
                 if h.get('mac-address', '').upper() == mac:
                     try:
                         recurso_host.remove(id=h['id'])
                     except: pass
             
-            # C) Derruba o IP antigo do servidor DHCP (Isso obriga o celular a pegar a configuração nova)
+            # C) Apaga o registro no DHCP Server (Lease da pool de login)
+            # Isso força o aparelho a pedir um IP novo e ser encaixado na pool do perfil
             try:
                 recurso_dhcp = api.get_resource('/ip/dhcp-server/lease')
                 leases = recurso_dhcp.get()
                 for l in leases:
                     if l.get('mac-address', '').upper() == mac:
                         recurso_dhcp.remove(id=l['id'])
-            except Exception:
-                pass # Ignora se falhar ao derrubar do DHCP, não vai quebrar o script
+            except Exception as e:
+                pass 
 
             conexao.disconnect()
 
             solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
             
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Perfil:* {perfil}\n*IP Atribuído:* `{ip_entregue or 'Aguardando Dispositivo...'}`\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Perfil:* {perfil}\n*Ação:* Forçando renovação de IP via DHCP\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             return True, "aprovado", msg
 
         except Exception as e:
@@ -177,7 +167,7 @@ def executar_acao(acao, mac):
 @app.route('/solicitar', methods=['POST'])
 def solicitar():
     dados = request.json
-    mac = dados.get('mac', '').upper() # Já garante que o MAC entra padronizado
+    mac = dados.get('mac', '').upper() 
     ip = dados.get('ip')
     nome = dados.get('nome', 'Visitante Sem Nome').strip()
     if not nome: nome = 'Visitante Sem Nome'
