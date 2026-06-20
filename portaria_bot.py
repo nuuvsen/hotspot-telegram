@@ -75,11 +75,12 @@ def executar_acao(acao, mac):
     nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
-        if "10m" in acao: tempo = "00:10:00"; txt_tempo = "10 Minutos"
-        elif "30m" in acao: tempo = "00:30:00"; txt_tempo = "30 Minutos"
-        elif "1h" in acao: tempo = "01:00:00"; txt_tempo = "1 Hora"
-        elif "5h" in acao: tempo = "05:00:00"; txt_tempo = "5 Horas"
-        else: tempo = "ilimitado"; txt_tempo = "Tempo Ilimitado"
+        # Agora definimos a variável 'perfil' dinamicamente com base na ação
+        if "10m" in acao: tempo = "00:10:00"; txt_tempo = "10 Minutos"; perfil = "10m"
+        elif "30m" in acao: tempo = "00:30:00"; txt_tempo = "30 Minutos"; perfil = "30m"
+        elif "1h" in acao: tempo = "01:00:00"; txt_tempo = "1 Hora"; perfil = "1h"
+        elif "5h" in acao: tempo = "05:00:00"; txt_tempo = "5 Horas"; perfil = "5h"
+        else: tempo = "ilimitado"; txt_tempo = "Tempo Ilimitado"; perfil = "ilimitado"
         
         usuario_gerado = f"vis_{mac.replace(':', '')}"
         senha_gerada = gerar_senha()
@@ -94,7 +95,7 @@ def executar_acao(acao, mac):
             parametros_mk = {
                 'password': senha_gerada, 
                 'mac-address': mac, 
-                'profile': 'convidado',
+                'profile': perfil, # <--- AQUI: Usa o perfil correspondente ao tempo escolhido!
                 'disabled': 'false',
                 'comment': f"Nome: {nome_cliente}"
             }
@@ -116,7 +117,7 @@ def executar_acao(acao, mac):
             conexao.disconnect()
 
             solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo Autorizado:* {txt_tempo}\n*Perfil:* {perfil}\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             return True, "aprovado", msg
 
         except Exception as e:
