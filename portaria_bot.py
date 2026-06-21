@@ -185,20 +185,26 @@ def executar_acao(acao, mac):
                 if a.get('mac-address', '').upper() == mac:
                     api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
+            # Limpa hosts órfãos para forçar login
             todos_hosts = recurso_host.get()
             for h in todos_hosts:
                 if h.get('mac-address', '').upper() == mac:
-                    try:
-                        recurso_host.remove(id=h['id'])
+                    try: recurso_host.remove(id=h['id'])
                     except: pass
             
+            # === NOVA LÓGICA DE DHCP: FIXA O IP (MAKE-STATIC) ===
             try:
                 leases = recurso_dhcp.get()
                 for l in leases:
                     if l.get('mac-address', '').upper() == mac:
-                        recurso_dhcp.remove(id=l['id'])
+                        # Se o IP for dinâmico, transforma em estático
+                        if l.get('dynamic') == 'true':
+                            recurso_dhcp.call('make-static', {'.id': l['id']})
+                        
+                        # Adiciona um comentário bonitinho no DHCP
+                        recurso_dhcp.set(id=l['id'], comment=f"Fixo/Ativo: {nome_cliente} ({perfil})")
             except Exception as e:
-                pass 
+                print(f"Aviso ao fixar IP no DHCP: {e}") 
 
             conexao.disconnect()
 
@@ -215,9 +221,9 @@ def executar_acao(acao, mac):
             })
             
             if perfil == "ilimitado":
-                msg = f"✅ *Acesso Aprovado (Bypass Ativado)!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Ação:* IP fixado e login automático garantido.\n*MAC:* {mac}"
+                msg = f"✅ *Acesso Aprovado (Bypass Ativado)!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Ação:* IP fixado e Bypass garantido.\n*MAC:* {mac}"
             else:
-                msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Perfil:* {perfil}\n*Ação:* DHCP renovado para a Pool do perfil.\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+                msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Perfil:* {perfil}\n*Ação:* IP Fixado no DHCP e autorizado.\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
             
             return True, "aprovado", msg
 
@@ -247,6 +253,17 @@ def executar_acao(acao, mac):
             for a in actives:
                 if a.get('mac-address', '').upper() == mac_cliente or a.get('user') == usuario_gerado:
                     api.get_resource('/ip/hotspot/active').remove(id=a['id'])
+
+            # === NOVA LÓGICA DE DHCP: REMOVE O IP FIXO (UNFIX) ===
+            try:
+                recurso_dhcp = api.get_resource('/ip/dhcp-server/lease')
+                leases = recurso_dhcp.get()
+                for l in leases:
+                    if l.get('mac-address', '').upper() == mac_cliente:
+                        # Apaga o lease. Na próxima vez que o cliente conectar, pega um IP dinâmico limpo.
+                        recurso_dhcp.remove(id=l['id'])
+            except Exception as e:
+                print(f"Aviso ao remover IP fixo no DHCP: {e}")
 
             conexao.disconnect()
             solicitacoes[mac].update({"status": "desconectado", "time_left": "-", "estado_texto": "Conectado S/ Autorizacao" if solicitacoes[mac].get("is_online") else "Offline", "expire_at": None})
