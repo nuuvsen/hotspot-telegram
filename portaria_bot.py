@@ -2,6 +2,7 @@ import threading
 import time
 import random
 import string
+import re
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import telebot
@@ -33,6 +34,20 @@ config_sistema = {
 def gerar_senha(tamanho=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=tamanho))
 
+# Função para converter o tempo do MikroTik (ex: 1h2m3s) em segundos
+def parse_mikrotik_time(t_str):
+    if not t_str: return 0
+    total_seconds = 0
+    matches = re.findall(r'(\d+)([wdhms])', t_str)
+    for val, unit in matches:
+        val = int(val)
+        if unit == 'w': total_seconds += val * 604800
+        elif unit == 'd': total_seconds += val * 86400
+        elif unit == 'h': total_seconds += val * 3600
+        elif unit == 'm': total_seconds += val * 60
+        elif unit == 's': total_seconds += val
+    return total_seconds
+
 # === THREAD DE MONITORAMENTO MIKROTIK ===
 def monitorar_conexoes():
     while True:
@@ -41,30 +56,35 @@ def monitorar_conexoes():
                 conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
                 api = conexao.get_api()
                 
-                usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
-                ativos_dict = {u.get('user'): u for u in usuarios_ativos}
-                
                 hosts_ativos = api.get_resource('/ip/hotspot/host').get()
-                hosts_macs = [h.get('mac-address', '').upper() for h in hosts_ativos]
+                # Cria um dicionário dos hosts usando o MAC como chave para busca rápida
+                hosts_dict = {h.get('mac-address', '').upper(): h for h in hosts_ativos}
 
                 macs_para_desconectar = []
 
                 for mac, dados in solicitacoes.items():
-                    usuario = dados.get("user", "")
                     mac_upper = mac.upper()
                     
-                    is_in_host = mac_upper in hosts_macs
-                    is_in_active = usuario in ativos_dict if usuario else False
+                    # === VERIFICAÇÃO DE IDLE TIME ===
+                    host_info = hosts_dict.get(mac_upper)
+                    if host_info:
+                        idle_str = host_info.get('idle-time', '0s')
+                        idle_sec = parse_mikrotik_time(idle_str)
+                        # Se o idle-time for menor que 60 segundos, ele está ONLINE
+                        is_online = idle_sec < 60
+                    else:
+                        # Se sumiu do host, está totalmente offline
+                        is_online = False
                     
-                    dados["is_online"] = is_in_host or is_in_active
+                    dados["is_online"] = is_online
 
+                    # === GESTÃO DO TEMPO ===
                     if dados.get("status") == "aprovado":
                         expire_at = dados.get("expire_at")
                         
                         if expire_at is not None:
                             tempo_restante = int(expire_at - time.time())
                             
-                            # SE O SCRIPT ESTIVER CONFIGURADO PARA GERENCIAR O CORTE:
                             if config_sistema["gerenciar_tempo_script"] and tempo_restante <= 0:
                                 macs_para_desconectar.append(mac)
                                 continue
@@ -79,20 +99,21 @@ def monitorar_conexoes():
                         else:
                             dados["time_left"] = "Ilimitado"
 
-                        if is_in_active or (expire_at is None and is_in_host):
+                        if is_online:
                             dados["estado_texto"] = "Conectado Autorizado"
                         else:
                             dados["estado_texto"] = "Offline (Tempo Correndo)"
                             
                     else:
                         dados["time_left"] = "-"
-                        if is_in_host:
+                        if is_online:
                             dados["estado_texto"] = "Conectado S/ Autorizacao"
                         else:
                             dados["estado_texto"] = "Offline"
                 
                 conexao.disconnect()
 
+                # Desconecta os usuários que esgotaram o tempo
                 for m in macs_para_desconectar:
                     executar_acao("desconectar", m)
 
@@ -431,7 +452,6 @@ HTML_ADMIN = """
 
     <div class="modal-overlay" id="modalOverlay" onclick="fecharModais()"></div>
 
-    <!-- MODAL DE LOGIN -->
     <div class="modal" id="modalLogin">
         <button class="btn-fechar" onclick="fecharModais()">&times;</button>
         <h3 style="border:none; margin-bottom:5px;">🔒 Acesso Restrito</h3>
@@ -442,12 +462,10 @@ HTML_ADMIN = """
         <button class="btn btn-blue" style="width: 100%;" onclick="fazerLogin()">Entrar</button>
     </div>
 
-    <!-- MODAL DE GERÊNCIA MIKROTIK -->
     <div class="modal" id="modalConfig">
         <button class="btn-fechar" onclick="fecharModais()">&times;</button>
         <h3>⚙️ Gerenciador de Sistema e RB</h3>
         
-        <!-- Configurações Globais -->
         <div class="sys-config-box">
             <h4 style="margin: 0 0 10px 0; color: #1e293b; font-size: 15px;">Gestão Automática</h4>
             <label>
@@ -456,7 +474,6 @@ HTML_ADMIN = """
             </label>
         </div>
 
-        <!-- Lista de Perfis -->
         <h4 style="margin: 0 0 10px 0; color: #334155;">Perfis Existentes na RouterBoard</h4>
         <div style="max-height: 200px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 20px;">
             <table class="rb-table">
@@ -474,7 +491,6 @@ HTML_ADMIN = """
             </table>
         </div>
 
-        <!-- Formulário de Edição / Criação -->
         <h4 style="margin: 0 0 10px 0; color: #334155;" id="formTitle">Criar / Modificar Perfil</h4>
         <div class="grid-forms">
             <div class="form-group">
@@ -497,7 +513,6 @@ HTML_ADMIN = """
         </div>
     </div>
 
-    <!-- CONTEÚDO PRINCIPAL (PAINEL WEB) -->
     <div class="container">
         <button class="menu-btn" onclick="abrirMenuLogin()">
             <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M2.5 12a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5z"/></svg>
