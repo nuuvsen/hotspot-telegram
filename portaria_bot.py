@@ -29,9 +29,7 @@ def gerar_senha(tamanho=6):
 def monitorar_conexoes():
     while True:
         try:
-            aprovados = {mac: dados for mac, dados in solicitacoes.items() if dados.get("status") == "aprovado"}
-            
-            if aprovados:
+            if solicitacoes: # Agora monitora TODAS as solicitações, não só os aprovados
                 conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
                 api = conexao.get_api()
                 
@@ -39,34 +37,40 @@ def monitorar_conexoes():
                 usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
                 ativos_dict = {u.get('user'): u for u in usuarios_ativos}
                 
-                # Pega os hosts apenas para salvar quem é "Ilimitado" (Bypass não entra no Active)
+                # Pega os hosts (quem está fisicamente grudado na antena)
                 hosts_ativos = api.get_resource('/ip/hotspot/host').get()
                 hosts_macs = [h.get('mac-address', '').upper() for h in hosts_ativos]
 
-                for mac, dados in aprovados.items():
-                    usuario = dados.get("user")
+                for mac, dados in solicitacoes.items():
+                    usuario = dados.get("user", "")
                     mac_upper = mac.upper()
                     
-                    # 1. Checagem rigorosa: Está na aba ACTIVE?
-                    if usuario in ativos_dict:
-                        dados["is_online"] = True
-                        info_ativo = ativos_dict[usuario]
-                        dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
+                    is_in_host = mac_upper in hosts_macs
+                    is_in_active = usuario in ativos_dict if usuario else False
                     
-                    else:
-                        # Se NÃO está no Active, em teoria está offline...
-                        # Mas se o plano for Ilimitado (Bypass), ele nunca vai pro Active, então checamos o Host
-                        if dados.get("time_left") == "Tempo Ilimitado":
-                            if mac_upper in hosts_macs:
-                                dados["is_online"] = True
-                                dados["time_left"] = "Tempo Ilimitado"
-                            else:
-                                dados["is_online"] = False
-                                dados["time_left"] = "Tempo Ilimitado"
+                    dados["is_online"] = is_in_host or is_in_active
+
+                    # LÓGICA DE CLASSIFICAÇÃO DE ESTADO
+                    if dados.get("status") == "aprovado":
+                        if is_in_active:
+                            dados["estado_texto"] = "Conectado Autorizado"
+                            info_ativo = ativos_dict[usuario]
+                            dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
+                        elif dados.get("time_left") == "Tempo Ilimitado" and is_in_host:
+                            # Bypass (não vai pro active, mas está no host)
+                            dados["estado_texto"] = "Conectado Autorizado"
                         else:
-                            # Usuários comuns (10m, 30m, etc) que saíram do Active vão direto pra Offline
-                            dados["is_online"] = False
-                            dados["time_left"] = "Offline"
+                            # Saiu do Wi-Fi, mas o tempo (ou o Ilimitado) ainda vale
+                            dados["estado_texto"] = "Offline (Autorizado)"
+                            if dados.get("time_left") != "Tempo Ilimitado":
+                                dados["time_left"] = "Ausente da rede" 
+                    else:
+                        # Pendente, Recusado ou Desconectado
+                        dados["time_left"] = "-"
+                        if is_in_host:
+                            dados["estado_texto"] = "Conectado S/ Autorizacao"
+                        else:
+                            dados["estado_texto"] = "Offline"
                 
                 conexao.disconnect()
         except Exception as e:
@@ -153,8 +157,8 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
 
-            # Alterado is_online para False na aprovação. Só ficará True quando o script achar ele no Active!
-            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
+            # Status visual será ajustado pela Thread de monitoramento nos próximos 10 segundos
+            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "estado_texto": "Conectando...", "time_left": txt_tempo})
             
             if perfil == "ilimitado":
                 msg = f"✅ *Acesso Aprovado (Bypass Ativado)!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Ação:* IP fixado e login automático garantido.\n*MAC:* {mac}"
@@ -167,7 +171,7 @@ def executar_acao(acao, mac):
             return False, "erro", f"Erro no MikroTik: {e}"
 
     elif acao == "recusar":
-        solicitacoes[mac]["status"] = "recusado"
+        solicitacoes[mac].update({"status": "recusado", "estado_texto": "Conectado S/ Autorizacao" if solicitacoes[mac].get("is_online") else "Offline"})
         return True, "recusado", f"🚫 *Acesso Recusado*\n\n*Nome:* {nome_cliente}\n*MAC:* {mac}"
 
     elif acao == "desconectar":
@@ -191,7 +195,7 @@ def executar_acao(acao, mac):
                     api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
             conexao.disconnect()
-            solicitacoes[mac].update({"status": "desconectado", "is_online": False, "time_left": "-"})
+            solicitacoes[mac].update({"status": "desconectado", "time_left": "-", "estado_texto": "Conectado S/ Autorizacao" if solicitacoes[mac].get("is_online") else "Offline"})
             return True, "desconectado", f"🛑 *Acesso Encerrado!*\n\nA conexão de {nome_cliente} foi bloqueada e removida da rede."
             
         except Exception as e:
@@ -219,7 +223,7 @@ def solicitar():
     
     solicitacoes[mac] = {
         "status": "pendente", "user": "", "password": "", "ip": ip, "nome": nome, 
-        "message_id": msg_enviada.message_id, "is_online": False, "time_left": "-"
+        "message_id": msg_enviada.message_id, "is_online": True, "estado_texto": "Conectado S/ Autorizacao", "time_left": "-"
     }
 
     return jsonify({"message": "Solicitação enviada"}), 200
@@ -277,10 +281,12 @@ HTML_ADMIN = """
         .live-indicator { display: inline-block; width: 8px; height: 8px; background-color: #10b981; border-radius: 50%; margin-right: 5px; animation: blink 1.5s infinite; }
         @keyframes blink { 0% {opacity: 1;} 50% {opacity: 0.4;} 100% {opacity: 1;} }
         
-        .conexao-info { font-size: 12px; margin-top: 5px; font-weight: 500;}
-        .online { color: #10b981; }
-        .offline { color: #ef4444; }
-        .tempo { color: #64748b; font-size: 11px; }
+        .conexao-info { font-size: 13px; margin-top: 5px; font-weight: 600; padding: 4px; border-radius: 5px;}
+        .estado-verde { color: #10b981; background-color: #ecfdf5;}
+        .estado-amarelo { color: #d97706; background-color: #fffbeb;}
+        .estado-cinza { color: #64748b; background-color: #f1f5f9;}
+        .estado-vermelho { color: #ef4444; background-color: #fef2f2;}
+        .tempo { color: #64748b; font-size: 11px; font-weight: normal; display: block; margin-top: 3px;}
     </style>
 </head>
 <body>
@@ -289,20 +295,20 @@ HTML_ADMIN = """
     <div class="container">
         <h2>Painel de Gerência Hotspot</h2>
         <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
-            <span class="live-indicator"></span> Sincronizado em tempo real com MikroTik & Telegram
+            <span class="live-indicator"></span> Monitoramento Inteligente: Identificando presença na antena e planos
         </div>
 
         <div class="tabs">
-            <button class="tab-btn active" id="btn-online" onclick="mudarAba('online')">🟢 Conectados / Pendentes</button>
-            <button class="tab-btn" id="btn-offline" onclick="mudarAba('offline')">📴 Autorizados Offline</button>
+            <button class="tab-btn active" id="btn-online" onclick="mudarAba('online')">🟢 Na Rede Local (Wi-Fi)</button>
+            <button class="tab-btn" id="btn-offline" onclick="mudarAba('offline')">📴 Dispositivos Offline</button>
         </div>
         
         <table id="tabela-solicitacoes">
             <thead>
                 <tr>
                     <th>Visitante / MAC</th>
-                    <th>IP</th>
-                    <th>Status / Conexão</th>
+                    <th>IP Base</th>
+                    <th>Estado Atual</th>
                     <th>Ações Rápidas</th>
                 </tr>
             </thead>
@@ -364,14 +370,13 @@ HTML_ADMIN = """
                 macs.forEach(mac => {
                     const req = data[mac];
                     
-                    // Lógica de Filtro das Abas
                     let mostrar = false;
                     if (filtroAtual === 'online') {
-                        // Mostra se está fisicamente online OU se está aguardando aprovação
-                        if (req.is_online === true || req.status === 'pendente') mostrar = true;
+                        // Está na rede local grudado na antena
+                        if (req.is_online === true) mostrar = true;
                     } else if (filtroAtual === 'offline') {
-                        // Mostra se está aprovado, mas o aparelho não está mais na rede
-                        if (req.is_online === false && req.status === 'aprovado') mostrar = true;
+                        // Não está na rede local
+                        if (req.is_online === false) mostrar = true;
                     }
 
                     if(!mostrar) return;
@@ -379,8 +384,21 @@ HTML_ADMIN = """
 
                     let botoes = '';
                     let statusClass = `badge-${req.status}`;
-                    let conexaoHtml = '';
+                    let stHtml = '';
+                    let timeText = req.time_left || '-';
                     
+                    // Renderização visual dos novos estados
+                    if (req.estado_texto === "Conectado Autorizado") {
+                        stHtml = `<div class="conexao-info estado-verde">🟢 Autorizado e Navegando<span class="tempo">⏳ Tempo: ${timeText}</span></div>`;
+                    } else if (req.estado_texto === "Conectado S/ Autorizacao") {
+                        stHtml = `<div class="conexao-info estado-amarelo">🟡 Conectado (Sem Internet)<span class="tempo">Falta aprovar ou plano acabou</span></div>`;
+                    } else if (req.estado_texto === "Offline (Autorizado)") {
+                        stHtml = `<div class="conexao-info estado-cinza">📴 Offline (Tem Plano)<span class="tempo">⏳ Tempo: ${timeText}</span></div>`;
+                    } else {
+                        stHtml = `<div class="conexao-info estado-vermelho">🔴 Offline e Sem Acesso<span class="tempo">Fora da rede</span></div>`;
+                    }
+
+                    // Ações disponíveis dependendo se está aprovado ou não
                     if(req.status === 'pendente' || req.status === 'desconectado' || req.status === 'recusado') {
                         botoes = `
                             <button class="btn btn-green" onclick="fazerAcao('aceitar_10m', '${mac}')">10m</button>
@@ -392,17 +410,13 @@ HTML_ADMIN = """
                         `;
                     } else if(req.status === 'aprovado') {
                         botoes = `<button class="btn btn-red" onclick="fazerAcao('desconectar', '${mac}')">🛑 Encerrar Acesso</button>`;
-                        
-                        let stOnline = req.is_online ? '<span class="online">🟢 Na Rede (Active)</span>' : '<span class="offline">🔴 Longe do Wi-Fi</span>';
-                        let timeText = req.time_left || '-';
-                        conexaoHtml = `<div class="conexao-info">${stOnline}<br><span class="tempo">⏳ Resta: ${timeText}</span></div>`;
                     }
                     
                     let tr = document.createElement('tr');
                     tr.innerHTML = `
                         <td><strong>${req.nome || 'Visitante'}</strong><br><span style="font-size:11px; color:#888;">${mac}</span></td>
                         <td>${req.ip || '-'}</td>
-                        <td><span class="status-badge ${statusClass}">${req.status.toUpperCase()}</span>${conexaoHtml}</td>
+                        <td><span class="status-badge ${statusClass}">${req.status.toUpperCase()}</span>${stHtml}</td>
                         <td><div class="acoes">${botoes}</div></td>
                     `;
                     tbody.appendChild(tr);
@@ -455,24 +469,25 @@ def callback_query(call):
     
     if acao == "atualizar":
         req = solicitacoes.get(mac)
-        if req and req.get("status") == "aprovado":
-            st_txt = "🟢 *Online*" if req.get("is_online") else "🔴 *Offline*"
+        if req:
+            st_txt = req.get("estado_texto", "Desconhecido")
             tempo_txt = req.get("time_left", "N/A")
             
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {req['nome']}\n*MAC:* {mac}\n\n*Status Conexão:* {st_txt}\n*Tempo Restante:* {tempo_txt}"
+            msg = f"🔄 *Status Atualizado*\n\n*Nome:* {req['nome']}\n*MAC:* {mac}\n\n*Status Conexão:* {st_txt}\n*Tempo Restante:* {tempo_txt}"
             
             markup_desc = InlineKeyboardMarkup()
-            markup_desc.add(
-                InlineKeyboardButton("🛑 Encerrar Acesso", callback_data=f"desconectar_{mac}"),
-                InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
-            )
+            if req.get("status") == "aprovado":
+                markup_desc.add(
+                    InlineKeyboardButton("🛑 Encerrar Acesso", callback_data=f"desconectar_{mac}"),
+                    InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
+                )
             try:
-                bot.edit_message_text(msg, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=markup_desc)
+                bot.edit_message_text(msg, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=markup_desc if req.get("status") == "aprovado" else None)
                 bot.answer_callback_query(call.id, "Status atualizado com sucesso!")
             except telebot.apihelper.ApiTelegramException:
                 bot.answer_callback_query(call.id, "O status já está atualizado.")
         else:
-            bot.answer_callback_query(call.id, "Usuário não está mais aprovado ou não encontrado.")
+            bot.answer_callback_query(call.id, "Usuário não encontrado.")
         return
 
     sucesso, status_result, msg = executar_acao(acao, mac)
