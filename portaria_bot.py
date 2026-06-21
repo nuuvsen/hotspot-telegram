@@ -17,7 +17,7 @@ MK_USER = 'bot'
 MK_PASS = 'Cleuven2106.'
 
 # Senha para acessar o menu web
-WEB_ADMIN_PASS = '123456'
+WEB_ADMIN_PASS = 'Cleuven2106.@'
 
 app = Flask(__name__)
 CORS(app)
