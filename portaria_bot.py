@@ -35,9 +35,11 @@ def monitorar_conexoes():
                 conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
                 api = conexao.get_api()
                 
+                # Pega usuários do Active (onde o tempo realmente rola)
                 usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
                 ativos_dict = {u.get('user'): u for u in usuarios_ativos}
                 
+                # Pega os hosts apenas para salvar quem é "Ilimitado" (Bypass não entra no Active)
                 hosts_ativos = api.get_resource('/ip/hotspot/host').get()
                 hosts_macs = [h.get('mac-address', '').upper() for h in hosts_ativos]
 
@@ -45,19 +47,25 @@ def monitorar_conexoes():
                     usuario = dados.get("user")
                     mac_upper = mac.upper()
                     
-                    # Verifica se está no Active ou pelo menos no Host (conectado na antena)
-                    if usuario in ativos_dict or mac_upper in hosts_macs:
+                    # 1. Checagem rigorosa: Está na aba ACTIVE?
+                    if usuario in ativos_dict:
                         dados["is_online"] = True
-                        if usuario in ativos_dict:
-                            info_ativo = ativos_dict[usuario]
-                            dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
-                        elif dados.get("time_left") == "Tempo Ilimitado":
-                            dados["time_left"] = "Tempo Ilimitado"
+                        info_ativo = ativos_dict[usuario]
+                        dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
+                    
                     else:
-                        dados["is_online"] = False
+                        # Se NÃO está no Active, em teoria está offline...
+                        # Mas se o plano for Ilimitado (Bypass), ele nunca vai pro Active, então checamos o Host
                         if dados.get("time_left") == "Tempo Ilimitado":
-                            dados["is_online"] = False # Bypassado mas fora da rede
+                            if mac_upper in hosts_macs:
+                                dados["is_online"] = True
+                                dados["time_left"] = "Tempo Ilimitado"
+                            else:
+                                dados["is_online"] = False
+                                dados["time_left"] = "Tempo Ilimitado"
                         else:
+                            # Usuários comuns (10m, 30m, etc) que saíram do Active vão direto pra Offline
+                            dados["is_online"] = False
                             dados["time_left"] = "Offline"
                 
                 conexao.disconnect()
@@ -145,7 +153,8 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
 
-            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": True, "time_left": txt_tempo})
+            # Alterado is_online para False na aprovação. Só ficará True quando o script achar ele no Active!
+            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
             
             if perfil == "ilimitado":
                 msg = f"✅ *Acesso Aprovado (Bypass Ativado)!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Ação:* IP fixado e login automático garantido.\n*MAC:* {mac}"
@@ -210,7 +219,7 @@ def solicitar():
     
     solicitacoes[mac] = {
         "status": "pendente", "user": "", "password": "", "ip": ip, "nome": nome, 
-        "message_id": msg_enviada.message_id, "is_online": True, "time_left": "-"
+        "message_id": msg_enviada.message_id, "is_online": False, "time_left": "-"
     }
 
     return jsonify({"message": "Solicitação enviada"}), 200
@@ -384,7 +393,7 @@ HTML_ADMIN = """
                     } else if(req.status === 'aprovado') {
                         botoes = `<button class="btn btn-red" onclick="fazerAcao('desconectar', '${mac}')">🛑 Encerrar Acesso</button>`;
                         
-                        let stOnline = req.is_online ? '<span class="online">🟢 Na Rede</span>' : '<span class="offline">🔴 Longe do Wi-Fi</span>';
+                        let stOnline = req.is_online ? '<span class="online">🟢 Na Rede (Active)</span>' : '<span class="offline">🔴 Longe do Wi-Fi</span>';
                         let timeText = req.time_left || '-';
                         conexaoHtml = `<div class="conexao-info">${stOnline}<br><span class="tempo">⏳ Resta: ${timeText}</span></div>`;
                     }
