@@ -29,17 +29,18 @@ def gerar_senha(tamanho=6):
 def monitorar_conexoes():
     while True:
         try:
-            if solicitacoes: # Agora monitora TODAS as solicitações, não só os aprovados
+            if solicitacoes: 
                 conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
                 api = conexao.get_api()
                 
-                # Pega usuários do Active (onde o tempo realmente rola)
                 usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
                 ativos_dict = {u.get('user'): u for u in usuarios_ativos}
                 
-                # Pega os hosts (quem está fisicamente grudado na antena)
                 hosts_ativos = api.get_resource('/ip/hotspot/host').get()
                 hosts_macs = [h.get('mac-address', '').upper() for h in hosts_ativos]
+
+                # Criamos uma lista para quem esgotou o tempo (evita bugar o loop iterando o dicionário)
+                macs_para_desconectar = []
 
                 for mac, dados in solicitacoes.items():
                     usuario = dados.get("user", "")
@@ -52,18 +53,30 @@ def monitorar_conexoes():
 
                     # LÓGICA DE CLASSIFICAÇÃO DE ESTADO
                     if dados.get("status") == "aprovado":
-                        if is_in_active:
-                            dados["estado_texto"] = "Conectado Autorizado"
-                            info_ativo = ativos_dict[usuario]
-                            dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
-                        elif dados.get("time_left") == "Tempo Ilimitado" and is_in_host:
-                            # Bypass (não vai pro active, mas está no host)
+                        expire_at = dados.get("expire_at")
+                        
+                        # CHECAGEM DO RELÓGIO ABSOLUTO (PYTHON)
+                        if expire_at is not None:
+                            tempo_restante = int(expire_at - time.time())
+                            
+                            if tempo_restante <= 0:
+                                macs_para_desconectar.append(mac)
+                                continue # Pula o processamento visual pois ele será cortado agora
+                            
+                            # Formata o tempo restante (00h 00m 00s)
+                            m, s = divmod(tempo_restante, 60)
+                            h, m = divmod(m, 60)
+                            dados["time_left"] = f"{h}h {m}m" if h > 0 else f"{m}m {s}s"
+                        else:
+                            dados["time_left"] = "Ilimitado"
+
+                        # DEFINE STATUS VISUAL
+                        if is_in_active or (expire_at is None and is_in_host):
                             dados["estado_texto"] = "Conectado Autorizado"
                         else:
-                            # Saiu do Wi-Fi, mas o tempo (ou o Ilimitado) ainda vale
-                            dados["estado_texto"] = "Offline (Autorizado)"
-                            if dados.get("time_left") != "Tempo Ilimitado":
-                                dados["time_left"] = "Ausente da rede" 
+                            # Mesmo que ele desligue o Wi-fi, o status mostra o tempo descendo
+                            dados["estado_texto"] = "Offline (Tempo Correndo)"
+                            
                     else:
                         # Pendente, Recusado ou Desconectado
                         dados["time_left"] = "-"
@@ -73,6 +86,11 @@ def monitorar_conexoes():
                             dados["estado_texto"] = "Offline"
                 
                 conexao.disconnect()
+
+                # Desconecta ativamente quem esgotou o tempo
+                for m in macs_para_desconectar:
+                    executar_acao("desconectar", m)
+
         except Exception as e:
             print(f"Erro no monitoramento: {e}")
         
@@ -88,11 +106,13 @@ def executar_acao(acao, mac):
     nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
-        if "10m" in acao: txt_tempo = "10 Minutos"; perfil = "10m"
-        elif "30m" in acao: txt_tempo = "30 Minutos"; perfil = "30m"
-        elif "1h" in acao: txt_tempo = "1 Hora"; perfil = "1h"
-        elif "5h" in acao: txt_tempo = "5 Horas"; perfil = "5h"
-        else: txt_tempo = "Tempo Ilimitado"; perfil = "ilimitado"
+        # Mapeando os tempos e calculando segundos absolutos
+        segundos = 0
+        if "10m" in acao: txt_tempo = "10 Minutos"; perfil = "10m"; segundos = 600
+        elif "30m" in acao: txt_tempo = "30 Minutos"; perfil = "30m"; segundos = 1800
+        elif "1h" in acao: txt_tempo = "1 Hora"; perfil = "1h"; segundos = 3600
+        elif "5h" in acao: txt_tempo = "5 Horas"; perfil = "5h"; segundos = 18000
+        else: txt_tempo = "Tempo Ilimitado"; perfil = "ilimitado"; segundos = 0
         
         usuario_gerado = f"vis_{mac.replace(':', '')}"
         senha_gerada = gerar_senha()
@@ -157,8 +177,19 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
 
+            # LÓGICA DE TEMPO ABSOLUTO EM PYTHON
+            expire_time = time.time() + segundos if segundos > 0 else None
+
             # Status visual será ajustado pela Thread de monitoramento nos próximos 10 segundos
-            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "estado_texto": "Conectando...", "time_left": txt_tempo})
+            solicitacoes[mac].update({
+                "status": "aprovado", 
+                "user": usuario_gerado, 
+                "password": senha_gerada, 
+                "is_online": False, 
+                "estado_texto": "Conectando...", 
+                "time_left": txt_tempo,
+                "expire_at": expire_time
+            })
             
             if perfil == "ilimitado":
                 msg = f"✅ *Acesso Aprovado (Bypass Ativado)!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Ação:* IP fixado e login automático garantido.\n*MAC:* {mac}"
@@ -195,7 +226,7 @@ def executar_acao(acao, mac):
                     api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
             conexao.disconnect()
-            solicitacoes[mac].update({"status": "desconectado", "time_left": "-", "estado_texto": "Conectado S/ Autorizacao" if solicitacoes[mac].get("is_online") else "Offline"})
+            solicitacoes[mac].update({"status": "desconectado", "time_left": "-", "estado_texto": "Conectado S/ Autorizacao" if solicitacoes[mac].get("is_online") else "Offline", "expire_at": None})
             return True, "desconectado", f"🛑 *Acesso Encerrado!*\n\nA conexão de {nome_cliente} foi bloqueada e removida da rede."
             
         except Exception as e:
@@ -223,7 +254,7 @@ def solicitar():
     
     solicitacoes[mac] = {
         "status": "pendente", "user": "", "password": "", "ip": ip, "nome": nome, 
-        "message_id": msg_enviada.message_id, "is_online": True, "estado_texto": "Conectado S/ Autorizacao", "time_left": "-"
+        "message_id": msg_enviada.message_id, "is_online": True, "estado_texto": "Conectado S/ Autorizacao", "time_left": "-", "expire_at": None
     }
 
     return jsonify({"message": "Solicitação enviada"}), 200
@@ -295,7 +326,7 @@ HTML_ADMIN = """
     <div class="container">
         <h2>Painel de Gerência Hotspot</h2>
         <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
-            <span class="live-indicator"></span> Monitoramento Inteligente: Identificando presença na antena e planos
+            <span class="live-indicator"></span> Monitoramento Inteligente: Calculando tempo no servidor
         </div>
 
         <div class="tabs">
@@ -392,8 +423,8 @@ HTML_ADMIN = """
                         stHtml = `<div class="conexao-info estado-verde">🟢 Autorizado e Navegando<span class="tempo">⏳ Tempo: ${timeText}</span></div>`;
                     } else if (req.estado_texto === "Conectado S/ Autorizacao") {
                         stHtml = `<div class="conexao-info estado-amarelo">🟡 Conectado (Sem Internet)<span class="tempo">Falta aprovar ou plano acabou</span></div>`;
-                    } else if (req.estado_texto === "Offline (Autorizado)") {
-                        stHtml = `<div class="conexao-info estado-cinza">📴 Offline (Tem Plano)<span class="tempo">⏳ Tempo: ${timeText}</span></div>`;
+                    } else if (req.estado_texto === "Offline (Tempo Correndo)") {
+                        stHtml = `<div class="conexao-info estado-cinza">📴 Offline (Tempo Correndo)<span class="tempo">⏳ Resta: ${timeText}</span></div>`;
                     } else {
                         stHtml = `<div class="conexao-info estado-vermelho">🔴 Offline e Sem Acesso<span class="tempo">Fora da rede</span></div>`;
                     }
