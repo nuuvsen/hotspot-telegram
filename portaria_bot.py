@@ -261,7 +261,28 @@ def status():
 def admin_dados():
     return jsonify(solicitacoes)
 
-# === ROTA DO MENU DE CONFIGURAÇÃO MIKROTIK ===
+# === ROTAS DO MENU DE CONFIGURAÇÃO MIKROTIK ===
+@app.route('/admin/login', methods=['POST'])
+def admin_login():
+    senha = request.json.get('senha')
+    if senha == WEB_ADMIN_PASS:
+        return jsonify({"sucesso": True})
+    return jsonify({"sucesso": False, "mensagem": "Senha incorreta."})
+
+@app.route('/admin/get_profiles', methods=['POST'])
+def get_profiles():
+    if request.json.get('senha') != WEB_ADMIN_PASS:
+        return jsonify({"sucesso": False, "mensagem": "Acesso negado."})
+    
+    try:
+        conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
+        api = conexao.get_api()
+        profiles = api.get_resource('/ip/hotspot/user/profile').get()
+        conexao.disconnect()
+        return jsonify({"sucesso": True, "profiles": profiles})
+    except Exception as e:
+        return jsonify({"sucesso": False, "mensagem": str(e)})
+
 @app.route('/admin/config_mk', methods=['POST'])
 def config_mk():
     dados = request.json
@@ -285,15 +306,15 @@ def config_mk():
             existente = recurso_profile.get(name=nome_perfil)
             
             parametros = {'session-timeout': session_time, 'rate-limit': rate_limit, 'shared-users': '1'}
-            # Filtra parametros vazios
-            parametros = {k: v for k, v in parametros.items() if v}
+            # Filtra parametros vazios para não apagar os que não foram enviados
+            parametros = {k: v for k, v in parametros.items() if v != ""}
             
             if existente:
                 recurso_profile.set(id=existente[0]['id'], **parametros)
-                msg = f"Perfil '{nome_perfil}' atualizado na RB!"
+                msg = f"Perfil '{nome_perfil}' atualizado com sucesso!"
             else:
                 recurso_profile.add(name=nome_perfil, **parametros)
-                msg = f"Perfil '{nome_perfil}' criado na RB!"
+                msg = f"Perfil '{nome_perfil}' criado com sucesso!"
                 
         conexao.disconnect()
         return jsonify({"sucesso": True, "mensagem": msg})
@@ -316,42 +337,63 @@ HTML_ADMIN = """
         .container { max-width: 1050px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); position: relative; }
         h2 { text-align: center; color: #2563eb; margin-top: 0; }
         
-        #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 5px; padding: 16px; position: fixed; z-index: 100; right: 20px; top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: 0.3s; }
+        #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 5px; padding: 16px; position: fixed; z-index: 9999; right: 20px; top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: 0.3s; }
         #toast.show { visibility: visible; }
         #toast.success { background-color: #10b981; }
         #toast.error { background-color: #ef4444; }
 
-        /* Estilos do Botão Menu e Modal */
-        .menu-btn { position: absolute; top: 20px; left: 20px; background: #2563eb; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-weight: bold; }
-        .menu-btn:hover { background: #1d4ed8; }
+        /* Botão Menu Principal */
+        .menu-btn { position: absolute; top: 20px; left: 20px; background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; display: flex; align-items: center; gap: 8px; }
+        .menu-btn:hover { background: #1d4ed8; box-shadow: 0 4px 10px rgba(37, 99, 235, 0.3); }
         
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 50; }
-        .modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 25px; border-radius: 10px; width: 90%; max-width: 400px; z-index: 51; box-shadow: 0 10px 25px rgba(0,0,0,0.2); display: none; }
-        .modal.active, .modal-overlay.active { display: block; }
-        .modal h3 { margin-top: 0; color: #333; border-bottom: 1px solid #eee; padding-bottom: 10px; }
-        .form-group { margin-bottom: 15px; }
-        .form-group label { display: block; font-size: 13px; color: #64748b; margin-bottom: 5px; }
-        .form-group input { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 5px; font-size: 14px; }
-        .btn-fechar { float: right; background: none; border: none; font-size: 20px; cursor: pointer; color: #999; }
+        /* Modais */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(15, 23, 42, 0.6); z-index: 50; backdrop-filter: blur(4px); }
+        .modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) scale(0.95); background: white; padding: 25px; border-radius: 12px; width: 90%; z-index: 51; box-shadow: 0 20px 40px rgba(0,0,0,0.2); display: none; opacity: 0; transition: all 0.3s ease; }
+        .modal.active { display: block; opacity: 1; transform: translate(-50%, -50%) scale(1); }
+        .modal-overlay.active { display: block; }
+        
+        #modalLogin { max-width: 350px; text-align: center; }
+        #modalConfig { max-width: 800px; max-height: 90vh; overflow-y: auto; }
 
+        .modal h3 { margin-top: 0; color: #1e293b; border-bottom: 2px solid #f1f5f9; padding-bottom: 12px; font-size: 20px; }
+        .btn-fechar { position: absolute; top: 15px; right: 20px; background: #f1f5f9; border: none; font-size: 18px; cursor: pointer; color: #64748b; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; transition: 0.2s; }
+        .btn-fechar:hover { background: #e2e8f0; color: #ef4444; }
+
+        /* Formulários */
+        .form-group { margin-bottom: 15px; text-align: left; }
+        .form-group label { display: block; font-size: 13px; color: #475569; margin-bottom: 6px; font-weight: 600; }
+        .form-group input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; transition: 0.2s; }
+        .form-group input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
+
+        /* Tabela de Perfis na RB */
+        .rb-table { width: 100%; border-collapse: collapse; margin-top: 10px; margin-bottom: 25px; font-size: 13px; }
+        .rb-table th { background: #f8fafc; color: #475569; padding: 12px; border-bottom: 2px solid #e2e8f0; text-align: left; }
+        .rb-table td { padding: 12px; border-bottom: 1px solid #f1f5f9; color: #334155; }
+        .rb-table tr:hover { background-color: #f8fafc; }
+        .btn-edit { background: #f59e0b; color: white; border: none; padding: 6px 12px; border-radius: 5px; cursor: pointer; font-size: 12px; font-weight: bold; }
+        .btn-edit:hover { background: #d97706; }
+
+        /* Botões Gerais */
+        .btn { padding: 10px 15px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 13px; transition: 0.2s; color: white; }
+        .btn-green { background-color: #10b981; } .btn-green:hover { background-color: #059669; }
+        .btn-blue { background-color: #3b82f6; } .btn-blue:hover { background-color: #2563eb; }
+        .btn-red { background-color: #ef4444; } .btn-red:hover { background-color: #dc2626; }
+        .acoes { display: flex; flex-wrap: wrap; justify-content: center; gap: 5px; }
+
+        /* Abas Principais */
         .tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; margin-top: 20px; }
         .tab-btn { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; background-color: #e2e8f0; color: #475569; transition: 0.3s; }
         .tab-btn.active { background-color: #2563eb; color: #fff; }
 
+        /* Tabela Principal de Visitantes */
         .status-badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; color: white; display: inline-block; }
         .badge-pendente { background-color: #f59e0b; }
         .badge-aprovado { background-color: #10b981; }
         .badge-recusado, .badge-desconectado { background-color: #ef4444; }
 
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
-        th, td { padding: 15px 10px; border-bottom: 1px solid #eee; text-align: center; vertical-align: middle; }
-        th { background-color: #f8fafc; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-        
-        .btn { padding: 8px 12px; margin: 3px; border: none; border-radius: 6px; cursor: pointer; color: white; font-weight: 600; font-size: 12px; transition: 0.2s; }
-        .btn-green { background-color: #10b981; } .btn-green:hover { background-color: #059669; }
-        .btn-blue { background-color: #3b82f6; } .btn-blue:hover { background-color: #2563eb; }
-        .btn-red { background-color: #ef4444; } .btn-red:hover { background-color: #dc2626; }
-        .acoes { display: flex; flex-wrap: wrap; justify-content: center; gap: 5px; }
+        #tabela-solicitacoes { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
+        #tabela-solicitacoes th, #tabela-solicitacoes td { padding: 15px 10px; border-bottom: 1px solid #eee; text-align: center; vertical-align: middle; }
+        #tabela-solicitacoes th { background-color: #f8fafc; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
         
         .live-indicator { display: inline-block; width: 8px; height: 8px; background-color: #10b981; border-radius: 50%; margin-right: 5px; animation: blink 1.5s infinite; }
         @keyframes blink { 0% {opacity: 1;} 50% {opacity: 0.4;} 100% {opacity: 1;} }
@@ -362,33 +404,74 @@ HTML_ADMIN = """
         .estado-cinza { color: #64748b; background-color: #f1f5f9;}
         .estado-vermelho { color: #ef4444; background-color: #fef2f2;}
         .tempo { color: #64748b; font-size: 11px; font-weight: normal; display: block; margin-top: 3px;}
+        
+        .grid-forms { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        @media(max-width: 600px) { .grid-forms { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
     <div id="toast">Notificação</div>
 
-    <div class="modal-overlay" id="modalOverlay" onclick="fecharModal()"></div>
+    <div class="modal-overlay" id="modalOverlay" onclick="fecharModais()"></div>
+
+    <div class="modal" id="modalLogin">
+        <button class="btn-fechar" onclick="fecharModais()">&times;</button>
+        <h3 style="border:none; margin-bottom:5px;">🔒 Acesso Restrito</h3>
+        <p style="font-size: 13px; color:#64748b; margin-bottom: 20px;">Insira a senha para gerenciar o MikroTik.</p>
+        <div class="form-group">
+            <input type="password" id="inputSenha" placeholder="Digite sua senha" onkeypress="if(event.key === 'Enter') fazerLogin()">
+        </div>
+        <button class="btn btn-blue" style="width: 100%;" onclick="fazerLogin()">Entrar</button>
+    </div>
+
     <div class="modal" id="modalConfig">
-        <button class="btn-fechar" onclick="fecharModal()">&times;</button>
-        <h3>⚙️ Configuração na RB</h3>
+        <button class="btn-fechar" onclick="fecharModais()">&times;</button>
+        <h3>⚙️ Gerenciador de Perfis (MikroTik)</h3>
         
-        <div class="form-group">
-            <label>Nome do Perfil (Ex: 30m, 1h, Visitante)</label>
-            <input type="text" id="mk_nome_perfil" placeholder="Nome do perfil">
+        <h4 style="margin: 0 0 10px 0; color: #334155;">Perfis Existentes</h4>
+        <div style="max-height: 200px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 20px;">
+            <table class="rb-table">
+                <thead>
+                    <tr>
+                        <th>Nome</th>
+                        <th>Tempo</th>
+                        <th>Banda (Queue)</th>
+                        <th>Ação</th>
+                    </tr>
+                </thead>
+                <tbody id="listaPerfisCorpo">
+                    <tr><td colspan="4" style="text-align:center;">Carregando perfis...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <h4 style="margin: 0 0 10px 0; color: #334155;" id="formTitle">Criar / Modificar Perfil</h4>
+        <div class="grid-forms">
+            <div class="form-group">
+                <label>Nome do Perfil</label>
+                <input type="text" id="mk_nome_perfil" placeholder="Ex: Visitante-1h">
+            </div>
+            <div class="form-group">
+                <label>Tempo de Sessão</label>
+                <input type="text" id="mk_session_time" placeholder="Ex: 01:00:00 (vazio = ilimitado)">
+            </div>
         </div>
         <div class="form-group">
-            <label>Tempo de Sessão (Ex: 00:30:00 para 30 min, vazio para ilimitado)</label>
-            <input type="text" id="mk_session_time" placeholder="00:30:00">
+            <label>Limite de Banda (Rx/Tx)</label>
+            <input type="text" id="mk_rate_limit" placeholder="Ex: 10M/10M (vazio = ilimitado)">
         </div>
-        <div class="form-group">
-            <label>Limite de Banda / Queue (Ex: 5M/5M, 10M/10M)</label>
-            <input type="text" id="mk_rate_limit" placeholder="5M/5M">
+        
+        <div style="display: flex; gap: 10px;">
+            <button class="btn btn-blue" style="flex: 1;" onclick="salvarPerfilRB()">💾 Salvar Perfil</button>
+            <button class="btn" style="background:#e2e8f0; color:#475569;" onclick="limparFormulario()">Limpar</button>
         </div>
-        <button class="btn btn-blue" style="width: 100%; font-size: 14px; padding: 10px;" onclick="salvarPerfilRB()">Enviar para RB</button>
     </div>
 
     <div class="container">
-        <button class="menu-btn" onclick="abrirMenu()">☰ Menu RB</button>
+        <button class="menu-btn" onclick="abrirMenuLogin()">
+            <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M2.5 12a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5z"/></svg>
+            Menu RB
+        </button>
         
         <h2>Painel de Gerência Hotspot</h2>
         <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
@@ -417,8 +500,9 @@ HTML_ADMIN = """
 
     <script>
         let filtroAtual = 'online';
-        let senhaAdmin = '';
+        let authPass = '';
 
+        /* --- UTILITÁRIOS --- */
         function showToast(msg, tipo) {
             const toast = document.getElementById("toast");
             toast.className = "show " + tipo;
@@ -426,32 +510,127 @@ HTML_ADMIN = """
             setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
         }
 
-        /* Lógica do Menu Modal */
-        function abrirMenu() {
-            if(!senhaAdmin) {
-                let senha = prompt("Digite a senha administrativa:");
-                if(senha) { senhaAdmin = senha; } else { return; }
-            }
-            document.getElementById('modalOverlay').classList.add('active');
-            document.getElementById('modalConfig').classList.add('active');
+        /* --- LÓGICA DE MODAIS E LOGIN --- */
+        function fecharModais() {
+            document.getElementById('modalOverlay').classList.remove('active');
+            document.getElementById('modalLogin').classList.remove('active');
+            document.getElementById('modalConfig').classList.remove('active');
         }
 
-        function fecharModal() {
-            document.getElementById('modalOverlay').classList.remove('active');
-            document.getElementById('modalConfig').classList.remove('active');
+        function abrirMenuLogin() {
+            if(authPass) {
+                abrirPainelRB();
+            } else {
+                document.getElementById('inputSenha').value = '';
+                document.getElementById('modalOverlay').classList.add('active');
+                document.getElementById('modalLogin').classList.add('active');
+                setTimeout(() => document.getElementById('inputSenha').focus(), 100);
+            }
+        }
+
+        function fazerLogin() {
+            const senha = document.getElementById('inputSenha').value;
+            if(!senha) return showToast("Digite a senha!", "error");
+
+            fetch('/admin/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ senha: senha })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.sucesso) {
+                    authPass = senha;
+                    showToast("Login aprovado!", "success");
+                    document.getElementById('modalLogin').classList.remove('active');
+                    abrirPainelRB();
+                } else {
+                    showToast(data.mensagem, "error");
+                }
+            }).catch(() => showToast("Erro de rede.", "error"));
+        }
+
+        /* --- LÓGICA DE PERFIS (RB) --- */
+        function abrirPainelRB() {
+            document.getElementById('modalOverlay').classList.add('active');
+            document.getElementById('modalConfig').classList.add('active');
+            carregarPerfisRB();
+        }
+
+        function carregarPerfisRB() {
+            const tbody = document.getElementById('listaPerfisCorpo');
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">Buscando dados na RB...</td></tr>';
+            
+            fetch('/admin/get_profiles', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ senha: authPass })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(!data.sucesso) {
+                    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:red;">${data.mensagem}</td></tr>`;
+                    return;
+                }
+                
+                tbody.innerHTML = '';
+                if(data.profiles.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">Nenhum perfil encontrado.</td></tr>';
+                } else {
+                    data.profiles.forEach(prof => {
+                        const nome = prof.name || '-';
+                        const tempo = prof['session-timeout'] || 'Ilimitado';
+                        const banda = prof['rate-limit'] || 'Ilimitado';
+                        
+                        let tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td><strong>${nome}</strong></td>
+                            <td>${tempo}</td>
+                            <td>${banda}</td>
+                            <td><button class="btn-edit" onclick="preencherFormEdit('${nome}', '${tempo}', '${banda}')">✏️ Editar</button></td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                }
+            }).catch(() => {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:red;">Erro ao buscar dados.</td></tr>';
+            });
+        }
+
+        function preencherFormEdit(nome, tempo, banda) {
+            document.getElementById('formTitle').innerText = "Modificar Perfil Existente";
+            document.getElementById('mk_nome_perfil').value = nome;
+            document.getElementById('mk_session_time').value = tempo === 'Ilimitado' ? '' : tempo;
+            document.getElementById('mk_rate_limit').value = banda === 'Ilimitado' ? '' : banda;
+            
+            // Dá um foco no primeiro input
+            document.getElementById('mk_session_time').focus();
+        }
+
+        function limparFormulario() {
+            document.getElementById('formTitle').innerText = "Criar Novo Perfil";
+            document.getElementById('mk_nome_perfil').value = '';
+            document.getElementById('mk_session_time').value = '';
+            document.getElementById('mk_rate_limit').value = '';
         }
 
         function salvarPerfilRB() {
             const btn = event.target;
-            btn.innerText = "Enviando...";
+            const originalText = btn.innerHTML;
+            btn.innerHTML = "⏳ Salvando...";
             
             const dados = {
-                senha: senhaAdmin,
+                senha: authPass,
                 acao: 'criar_perfil',
                 nome_perfil: document.getElementById('mk_nome_perfil').value,
                 session_time: document.getElementById('mk_session_time').value,
                 rate_limit: document.getElementById('mk_rate_limit').value
             };
+
+            if(!dados.nome_perfil) {
+                btn.innerHTML = originalText;
+                return showToast("O Nome do perfil é obrigatório!", "error");
+            }
 
             fetch('/admin/config_mk', {
                 method: 'POST',
@@ -460,31 +639,32 @@ HTML_ADMIN = """
             })
             .then(res => res.json())
             .then(data => {
-                btn.innerText = "Enviar para RB";
+                btn.innerHTML = originalText;
                 if(data.sucesso) {
                     showToast(data.mensagem, "success");
-                    fecharModal();
+                    limparFormulario();
+                    carregarPerfisRB(); // Recarrega a tabela automaticamente
                 } else {
                     showToast(data.mensagem, "error");
-                    if(data.mensagem.includes("Senha")) senhaAdmin = ''; // Reseta se errou
+                    if(data.mensagem.includes("Senha")) { authPass = ''; fecharModais(); }
                 }
             }).catch(e => {
-                btn.innerText = "Enviar para RB";
+                btn.innerHTML = originalText;
                 showToast("Erro de conexão.", "error");
             });
         }
 
-        /* Lógica Original da Tabela */
+        /* --- LÓGICA PRINCIPAL DA TABELA DE VISITANTES --- */
         function mudarAba(aba) {
             filtroAtual = aba;
             document.getElementById('btn-online').classList.remove('active');
             document.getElementById('btn-offline').classList.remove('active');
             document.getElementById('btn-' + aba).classList.add('active');
-            carregarDados();
+            carregarDadosVis();
         }
 
         function fazerAcao(acao, mac) {
-            event.target.innerText = "Processando...";
+            event.target.innerText = "⏳...";
             event.target.style.opacity = "0.5";
 
             fetch('/admin/acao', {
@@ -495,16 +675,16 @@ HTML_ADMIN = """
             .then(res => res.json())
             .then(data => {
                 if(data.sucesso) {
-                    showToast("Ação realizada com sucesso!", "success");
-                    carregarDados();
+                    showToast("Ação confirmada!", "success");
+                    carregarDadosVis();
                 } else {
                     showToast("Erro: " + data.mensagem, "error");
-                    carregarDados();
+                    carregarDadosVis();
                 }
             });
         }
 
-        function carregarDados() {
+        function carregarDadosVis() {
             fetch('/admin/dados')
             .then(res => res.json())
             .then(data => {
@@ -571,8 +751,8 @@ HTML_ADMIN = """
             });
         }
 
-        setInterval(carregarDados, 3000);
-        window.onload = carregarDados;
+        setInterval(carregarDadosVis, 3000);
+        window.onload = carregarDadosVis;
     </script>
 </body>
 </html>
