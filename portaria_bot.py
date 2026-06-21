@@ -37,19 +37,26 @@ def monitorar_conexoes():
                 
                 usuarios_ativos = api.get_resource('/ip/hotspot/active').get()
                 ativos_dict = {u.get('user'): u for u in usuarios_ativos}
+                
+                hosts_ativos = api.get_resource('/ip/hotspot/host').get()
+                hosts_macs = [h.get('mac-address', '').upper() for h in hosts_ativos]
 
                 for mac, dados in aprovados.items():
                     usuario = dados.get("user")
+                    mac_upper = mac.upper()
                     
-                    if usuario in ativos_dict:
+                    # Verifica se está no Active ou pelo menos no Host (conectado na antena)
+                    if usuario in ativos_dict or mac_upper in hosts_macs:
                         dados["is_online"] = True
-                        info_ativo = ativos_dict[usuario]
-                        dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
+                        if usuario in ativos_dict:
+                            info_ativo = ativos_dict[usuario]
+                            dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
+                        elif dados.get("time_left") == "Tempo Ilimitado":
+                            dados["time_left"] = "Tempo Ilimitado"
                     else:
                         dados["is_online"] = False
-                        # Se for ilimitado e bypassado, ele não aparece no active do hotspot, mas está online na rede
                         if dados.get("time_left") == "Tempo Ilimitado":
-                            dados["is_online"] = True 
+                            dados["is_online"] = False # Bypassado mas fora da rede
                         else:
                             dados["time_left"] = "Offline"
                 
@@ -61,7 +68,6 @@ def monitorar_conexoes():
 
 # === MOTOR DE AÇÕES ===
 def executar_acao(acao, mac):
-    # Padroniza o MAC para maiúsculo para garantir a busca correta no MK
     mac = mac.upper() 
     
     if mac not in solicitacoes:
@@ -87,23 +93,17 @@ def executar_acao(acao, mac):
             recurso_binding = api.get_resource('/ip/hotspot/ip-binding')
             recurso_dhcp = api.get_resource('/ip/dhcp-server/lease')
             
-            # ================================================================
-            # 1. CONFIGURAÇÃO BASEADA NO PLANO (ILIMITADO x COM TEMPO)
-            # ================================================================
             if perfil == "ilimitado":
-                # Para ilimitado, usamos IP Binding Bypassed (Fixa o IP e nunca mais pede senha)
                 bindings = recurso_binding.get(mac_address=mac)
                 if bindings:
                     recurso_binding.set(id=bindings[0]['id'], type='bypassed', comment=f"Ilimitado: {nome_cliente}")
                 else:
                     recurso_binding.add(mac_address=mac, type='bypassed', comment=f"Ilimitado: {nome_cliente}")
                 
-                # Remove do Hotspot User caso ele tivesse um plano de tempo antes
                 usuarios_existentes = recurso_user.get(name=usuario_gerado)
                 for u in usuarios_existentes: recurso_user.remove(id=u['id'])
                 
             else:
-                # Planos com tempo: Remove do Binding (se estava ilimitado antes) e cria usuário
                 bindings = recurso_binding.get(mac_address=mac)
                 for b in bindings: recurso_binding.remove(id=b['id'])
 
@@ -123,17 +123,11 @@ def executar_acao(acao, mac):
                     parametros_mk['name'] = usuario_gerado
                     recurso_user.add(**parametros_mk)
             
-            # ================================================================
-            # 2. DERRUBA AS SESSÕES E O DHCP PARA FORÇAR RENOVAÇÃO DO IP
-            # ================================================================
-            
-            # A) Derruba o usuário do Active (se existir)
             actives = api.get_resource('/ip/hotspot/active').get()
             for a in actives:
                 if a.get('mac-address', '').upper() == mac:
                     api.get_resource('/ip/hotspot/active').remove(id=a['id'])
 
-            # B) Derruba o dispositivo da aba Host
             todos_hosts = recurso_host.get()
             for h in todos_hosts:
                 if h.get('mac-address', '').upper() == mac:
@@ -141,8 +135,6 @@ def executar_acao(acao, mac):
                         recurso_host.remove(id=h['id'])
                     except: pass
             
-            # C) Apaga o registro no DHCP Server (Lease antigo da pool de login)
-            # Isso força o aparelho a pedir um IP novo e ser encaixado na pool certa
             try:
                 leases = recurso_dhcp.get()
                 for l in leases:
@@ -153,7 +145,7 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
 
-            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
+            solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": True, "time_left": txt_tempo})
             
             if perfil == "ilimitado":
                 msg = f"✅ *Acesso Aprovado (Bypass Ativado)!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Ação:* IP fixado e login automático garantido.\n*MAC:* {mac}"
@@ -176,17 +168,14 @@ def executar_acao(acao, mac):
             conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
             api = conexao.get_api()
             
-            # Bloqueia usuário normal
             users = api.get_resource('/ip/hotspot/user').get(name=usuario_gerado)
             for u in users:
                 api.get_resource('/ip/hotspot/user').set(id=u['id'], disabled='true')
             
-            # Remove do IP Binding caso seja ilimitado
             recurso_binding = api.get_resource('/ip/hotspot/ip-binding')
             bindings = recurso_binding.get(mac_address=mac_cliente)
             for b in bindings: recurso_binding.remove(id=b['id'])
             
-            # Derruba as sessões ativas
             actives = api.get_resource('/ip/hotspot/active').get()
             for a in actives:
                 if a.get('mac-address', '').upper() == mac_cliente or a.get('user') == usuario_gerado:
@@ -221,7 +210,7 @@ def solicitar():
     
     solicitacoes[mac] = {
         "status": "pendente", "user": "", "password": "", "ip": ip, "nome": nome, 
-        "message_id": msg_enviada.message_id, "is_online": False, "time_left": "-"
+        "message_id": msg_enviada.message_id, "is_online": True, "time_left": "-"
     }
 
     return jsonify({"message": "Solicitação enviada"}), 200
@@ -256,6 +245,10 @@ HTML_ADMIN = """
         #toast.success { background-color: #10b981; }
         #toast.error { background-color: #ef4444; }
 
+        .tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; }
+        .tab-btn { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; background-color: #e2e8f0; color: #475569; transition: 0.3s; }
+        .tab-btn.active { background-color: #2563eb; color: #fff; }
+
         .status-badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; color: white; display: inline-block; }
         .badge-pendente { background-color: #f59e0b; }
         .badge-aprovado { background-color: #10b981; }
@@ -289,6 +282,11 @@ HTML_ADMIN = """
         <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
             <span class="live-indicator"></span> Sincronizado em tempo real com MikroTik & Telegram
         </div>
+
+        <div class="tabs">
+            <button class="tab-btn active" id="btn-online" onclick="mudarAba('online')">🟢 Conectados / Pendentes</button>
+            <button class="tab-btn" id="btn-offline" onclick="mudarAba('offline')">📴 Autorizados Offline</button>
+        </div>
         
         <table id="tabela-solicitacoes">
             <thead>
@@ -306,11 +304,21 @@ HTML_ADMIN = """
     </div>
 
     <script>
+        let filtroAtual = 'online';
+
         function showToast(msg, tipo) {
             const toast = document.getElementById("toast");
             toast.className = "show " + tipo;
             toast.innerText = msg;
             setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
+        }
+
+        function mudarAba(aba) {
+            filtroAtual = aba;
+            document.getElementById('btn-online').classList.remove('active');
+            document.getElementById('btn-offline').classList.remove('active');
+            document.getElementById('btn-' + aba).classList.add('active');
+            carregarDados();
         }
 
         function fazerAcao(acao, mac) {
@@ -342,13 +350,24 @@ HTML_ADMIN = """
                 tbody.innerHTML = '';
                 const macs = Object.keys(data);
                 
-                if(macs.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" style="color:#94a3b8; padding:30px;">Nenhum dispositivo registrado ainda.</td></tr>';
-                    return;
-                }
+                let temRegistros = false;
                 
                 macs.forEach(mac => {
                     const req = data[mac];
+                    
+                    // Lógica de Filtro das Abas
+                    let mostrar = false;
+                    if (filtroAtual === 'online') {
+                        // Mostra se está fisicamente online OU se está aguardando aprovação
+                        if (req.is_online === true || req.status === 'pendente') mostrar = true;
+                    } else if (filtroAtual === 'offline') {
+                        // Mostra se está aprovado, mas o aparelho não está mais na rede
+                        if (req.is_online === false && req.status === 'aprovado') mostrar = true;
+                    }
+
+                    if(!mostrar) return;
+                    temRegistros = true;
+
                     let botoes = '';
                     let statusClass = `badge-${req.status}`;
                     let conexaoHtml = '';
@@ -365,7 +384,7 @@ HTML_ADMIN = """
                     } else if(req.status === 'aprovado') {
                         botoes = `<button class="btn btn-red" onclick="fazerAcao('desconectar', '${mac}')">🛑 Encerrar Acesso</button>`;
                         
-                        let stOnline = req.is_online ? '<span class="online">🟢 Online</span>' : '<span class="offline">🔴 Offline</span>';
+                        let stOnline = req.is_online ? '<span class="online">🟢 Na Rede</span>' : '<span class="offline">🔴 Longe do Wi-Fi</span>';
                         let timeText = req.time_left || '-';
                         conexaoHtml = `<div class="conexao-info">${stOnline}<br><span class="tempo">⏳ Resta: ${timeText}</span></div>`;
                     }
@@ -379,6 +398,10 @@ HTML_ADMIN = """
                     `;
                     tbody.appendChild(tr);
                 });
+
+                if(!temRegistros) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="color:#94a3b8; padding:30px;">Nenhum dispositivo nesta categoria.</td></tr>';
+                }
             });
         }
 
