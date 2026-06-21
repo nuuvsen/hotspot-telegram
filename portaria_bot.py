@@ -25,6 +25,11 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 solicitacoes = {}
 
+# Variável global de configuração do sistema
+config_sistema = {
+    "gerenciar_tempo_script": True
+}
+
 def gerar_senha(tamanho=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=tamanho))
 
@@ -59,13 +64,18 @@ def monitorar_conexoes():
                         if expire_at is not None:
                             tempo_restante = int(expire_at - time.time())
                             
-                            if tempo_restante <= 0:
+                            # SE O SCRIPT ESTIVER CONFIGURADO PARA GERENCIAR O CORTE:
+                            if config_sistema["gerenciar_tempo_script"] and tempo_restante <= 0:
                                 macs_para_desconectar.append(mac)
                                 continue
                             
                             m, s = divmod(tempo_restante, 60)
                             h, m = divmod(m, 60)
-                            dados["time_left"] = f"{h}h {m}m" if h > 0 else f"{m}m {s}s"
+                            
+                            if tempo_restante <= 0:
+                                dados["time_left"] = "Esgotado (Aguardando RB)"
+                            else:
+                                dados["time_left"] = f"{h}h {m}m" if h > 0 else f"{m}m {s}s"
                         else:
                             dados["time_left"] = "Ilimitado"
 
@@ -261,13 +271,25 @@ def status():
 def admin_dados():
     return jsonify(solicitacoes)
 
-# === ROTAS DO MENU DE CONFIGURAÇÃO MIKROTIK ===
+# === ROTAS DO MENU E SISTEMA GERAL ===
 @app.route('/admin/login', methods=['POST'])
 def admin_login():
     senha = request.json.get('senha')
     if senha == WEB_ADMIN_PASS:
         return jsonify({"sucesso": True})
     return jsonify({"sucesso": False, "mensagem": "Senha incorreta."})
+
+@app.route('/admin/config_sys', methods=['GET', 'POST'])
+def sys_config():
+    if request.method == 'GET':
+        return jsonify(config_sistema)
+    
+    dados = request.json
+    if dados.get('senha') != WEB_ADMIN_PASS:
+        return jsonify({"sucesso": False, "mensagem": "Acesso negado."})
+    
+    config_sistema["gerenciar_tempo_script"] = dados.get('gerenciar_tempo_script', True)
+    return jsonify({"sucesso": True, "mensagem": "Configuração salva!"})
 
 @app.route('/admin/get_profiles', methods=['POST'])
 def get_profiles():
@@ -300,13 +322,12 @@ def config_mk():
         if acao == "criar_perfil":
             nome_perfil = dados.get('nome_perfil')
             session_time = dados.get('session_time')
-            rate_limit = dados.get('rate_limit') # Ex: 5M/5M
+            rate_limit = dados.get('rate_limit')
             
             recurso_profile = api.get_resource('/ip/hotspot/user/profile')
             existente = recurso_profile.get(name=nome_perfil)
             
             parametros = {'session-timeout': session_time, 'rate-limit': rate_limit, 'shared-users': '1'}
-            # Filtra parametros vazios para não apagar os que não foram enviados
             parametros = {k: v for k, v in parametros.items() if v != ""}
             
             if existente:
@@ -342,11 +363,9 @@ HTML_ADMIN = """
         #toast.success { background-color: #10b981; }
         #toast.error { background-color: #ef4444; }
 
-        /* Botão Menu Principal */
         .menu-btn { position: absolute; top: 20px; left: 20px; background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; display: flex; align-items: center; gap: 8px; }
         .menu-btn:hover { background: #1d4ed8; box-shadow: 0 4px 10px rgba(37, 99, 235, 0.3); }
         
-        /* Modais */
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(15, 23, 42, 0.6); z-index: 50; backdrop-filter: blur(4px); }
         .modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) scale(0.95); background: white; padding: 25px; border-radius: 12px; width: 90%; z-index: 51; box-shadow: 0 20px 40px rgba(0,0,0,0.2); display: none; opacity: 0; transition: all 0.3s ease; }
         .modal.active { display: block; opacity: 1; transform: translate(-50%, -50%) scale(1); }
@@ -359,13 +378,14 @@ HTML_ADMIN = """
         .btn-fechar { position: absolute; top: 15px; right: 20px; background: #f1f5f9; border: none; font-size: 18px; cursor: pointer; color: #64748b; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; transition: 0.2s; }
         .btn-fechar:hover { background: #e2e8f0; color: #ef4444; }
 
-        /* Formulários */
         .form-group { margin-bottom: 15px; text-align: left; }
         .form-group label { display: block; font-size: 13px; color: #475569; margin-bottom: 6px; font-weight: 600; }
         .form-group input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; transition: 0.2s; }
         .form-group input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
 
-        /* Tabela de Perfis na RB */
+        .sys-config-box { background: #f8fafc; padding: 15px; border-radius: 8px; margin-bottom: 25px; border: 1px solid #e2e8f0; }
+        .sys-config-box label { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; color: #334155; font-weight: bold;}
+
         .rb-table { width: 100%; border-collapse: collapse; margin-top: 10px; margin-bottom: 25px; font-size: 13px; }
         .rb-table th { background: #f8fafc; color: #475569; padding: 12px; border-bottom: 2px solid #e2e8f0; text-align: left; }
         .rb-table td { padding: 12px; border-bottom: 1px solid #f1f5f9; color: #334155; }
@@ -373,19 +393,16 @@ HTML_ADMIN = """
         .btn-edit { background: #f59e0b; color: white; border: none; padding: 6px 12px; border-radius: 5px; cursor: pointer; font-size: 12px; font-weight: bold; }
         .btn-edit:hover { background: #d97706; }
 
-        /* Botões Gerais */
         .btn { padding: 10px 15px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 13px; transition: 0.2s; color: white; }
         .btn-green { background-color: #10b981; } .btn-green:hover { background-color: #059669; }
         .btn-blue { background-color: #3b82f6; } .btn-blue:hover { background-color: #2563eb; }
         .btn-red { background-color: #ef4444; } .btn-red:hover { background-color: #dc2626; }
         .acoes { display: flex; flex-wrap: wrap; justify-content: center; gap: 5px; }
 
-        /* Abas Principais */
         .tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; margin-top: 20px; }
         .tab-btn { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; background-color: #e2e8f0; color: #475569; transition: 0.3s; }
         .tab-btn.active { background-color: #2563eb; color: #fff; }
 
-        /* Tabela Principal de Visitantes */
         .status-badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; color: white; display: inline-block; }
         .badge-pendente { background-color: #f59e0b; }
         .badge-aprovado { background-color: #10b981; }
@@ -414,6 +431,7 @@ HTML_ADMIN = """
 
     <div class="modal-overlay" id="modalOverlay" onclick="fecharModais()"></div>
 
+    <!-- MODAL DE LOGIN -->
     <div class="modal" id="modalLogin">
         <button class="btn-fechar" onclick="fecharModais()">&times;</button>
         <h3 style="border:none; margin-bottom:5px;">🔒 Acesso Restrito</h3>
@@ -424,17 +442,28 @@ HTML_ADMIN = """
         <button class="btn btn-blue" style="width: 100%;" onclick="fazerLogin()">Entrar</button>
     </div>
 
+    <!-- MODAL DE GERÊNCIA MIKROTIK -->
     <div class="modal" id="modalConfig">
         <button class="btn-fechar" onclick="fecharModais()">&times;</button>
-        <h3>⚙️ Gerenciador de Perfis (MikroTik)</h3>
+        <h3>⚙️ Gerenciador de Sistema e RB</h3>
         
-        <h4 style="margin: 0 0 10px 0; color: #334155;">Perfis Existentes</h4>
+        <!-- Configurações Globais -->
+        <div class="sys-config-box">
+            <h4 style="margin: 0 0 10px 0; color: #1e293b; font-size: 15px;">Gestão Automática</h4>
+            <label>
+                <input type="checkbox" id="chkGerenciarTempo" onchange="salvarConfigSys()" style="width: 18px; height: 18px;">
+                Deixar o Script Python derrubar quem esgotar o tempo (Desmarque se a RB já faz isso nativamente pelo Profile)
+            </label>
+        </div>
+
+        <!-- Lista de Perfis -->
+        <h4 style="margin: 0 0 10px 0; color: #334155;">Perfis Existentes na RouterBoard</h4>
         <div style="max-height: 200px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 20px;">
             <table class="rb-table">
                 <thead>
                     <tr>
                         <th>Nome</th>
-                        <th>Tempo</th>
+                        <th>Tempo Limite</th>
                         <th>Banda (Queue)</th>
                         <th>Ação</th>
                     </tr>
@@ -445,6 +474,7 @@ HTML_ADMIN = """
             </table>
         </div>
 
+        <!-- Formulário de Edição / Criação -->
         <h4 style="margin: 0 0 10px 0; color: #334155;" id="formTitle">Criar / Modificar Perfil</h4>
         <div class="grid-forms">
             <div class="form-group">
@@ -462,11 +492,12 @@ HTML_ADMIN = """
         </div>
         
         <div style="display: flex; gap: 10px;">
-            <button class="btn btn-blue" style="flex: 1;" onclick="salvarPerfilRB()">💾 Salvar Perfil</button>
+            <button class="btn btn-blue" style="flex: 1;" onclick="salvarPerfilRB()">💾 Salvar Perfil na RB</button>
             <button class="btn" style="background:#e2e8f0; color:#475569;" onclick="limparFormulario()">Limpar</button>
         </div>
     </div>
 
+    <!-- CONTEÚDO PRINCIPAL (PAINEL WEB) -->
     <div class="container">
         <button class="menu-btn" onclick="abrirMenuLogin()">
             <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M2.5 12a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5z"/></svg>
@@ -475,7 +506,7 @@ HTML_ADMIN = """
         
         <h2>Painel de Gerência Hotspot</h2>
         <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
-            <span class="live-indicator"></span> Monitoramento Inteligente: Calculando tempo no servidor
+            <span class="live-indicator"></span> Monitoramento Inteligente: Analisando conexões...
         </div>
 
         <div class="tabs">
@@ -502,7 +533,6 @@ HTML_ADMIN = """
         let filtroAtual = 'online';
         let authPass = '';
 
-        /* --- UTILITÁRIOS --- */
         function showToast(msg, tipo) {
             const toast = document.getElementById("toast");
             toast.className = "show " + tipo;
@@ -510,7 +540,7 @@ HTML_ADMIN = """
             setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
         }
 
-        /* --- LÓGICA DE MODAIS E LOGIN --- */
+        /* --- LOGICA MODAL E LOGIN --- */
         function fecharModais() {
             document.getElementById('modalOverlay').classList.remove('active');
             document.getElementById('modalLogin').classList.remove('active');
@@ -541,7 +571,7 @@ HTML_ADMIN = """
             .then(data => {
                 if(data.sucesso) {
                     authPass = senha;
-                    showToast("Login aprovado!", "success");
+                    showToast("Acesso Liberado!", "success");
                     document.getElementById('modalLogin').classList.remove('active');
                     abrirPainelRB();
                 } else {
@@ -550,11 +580,38 @@ HTML_ADMIN = """
             }).catch(() => showToast("Erro de rede.", "error"));
         }
 
-        /* --- LÓGICA DE PERFIS (RB) --- */
+        /* --- GESTAO DO SISTEMA E RB --- */
         function abrirPainelRB() {
             document.getElementById('modalOverlay').classList.add('active');
             document.getElementById('modalConfig').classList.add('active');
+            carregarConfigSys();
             carregarPerfisRB();
+        }
+
+        function carregarConfigSys() {
+            fetch('/admin/config_sys')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('chkGerenciarTempo').checked = data.gerenciar_tempo_script;
+            });
+        }
+
+        function salvarConfigSys() {
+            const isChecked = document.getElementById('chkGerenciarTempo').checked;
+            fetch('/admin/config_sys', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ senha: authPass, gerenciar_tempo_script: isChecked })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.sucesso) {
+                    showToast("Lógica do sistema atualizada!", "success");
+                } else {
+                    showToast(data.mensagem, "error");
+                    document.getElementById('chkGerenciarTempo').checked = !isChecked; // desfaz se der erro
+                }
+            });
         }
 
         function carregarPerfisRB() {
@@ -592,8 +649,6 @@ HTML_ADMIN = """
                         tbody.appendChild(tr);
                     });
                 }
-            }).catch(() => {
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:red;">Erro ao buscar dados.</td></tr>';
             });
         }
 
@@ -602,8 +657,6 @@ HTML_ADMIN = """
             document.getElementById('mk_nome_perfil').value = nome;
             document.getElementById('mk_session_time').value = tempo === 'Ilimitado' ? '' : tempo;
             document.getElementById('mk_rate_limit').value = banda === 'Ilimitado' ? '' : banda;
-            
-            // Dá um foco no primeiro input
             document.getElementById('mk_session_time').focus();
         }
 
@@ -643,7 +696,7 @@ HTML_ADMIN = """
                 if(data.sucesso) {
                     showToast(data.mensagem, "success");
                     limparFormulario();
-                    carregarPerfisRB(); // Recarrega a tabela automaticamente
+                    carregarPerfisRB(); 
                 } else {
                     showToast(data.mensagem, "error");
                     if(data.mensagem.includes("Senha")) { authPass = ''; fecharModais(); }
@@ -654,7 +707,7 @@ HTML_ADMIN = """
             });
         }
 
-        /* --- LÓGICA PRINCIPAL DA TABELA DE VISITANTES --- */
+        /* --- VISUALIZACAO GERAL DE CONEXOES --- */
         function mudarAba(aba) {
             filtroAtual = aba;
             document.getElementById('btn-online').classList.remove('active');
