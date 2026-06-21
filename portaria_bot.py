@@ -47,7 +47,11 @@ def monitorar_conexoes():
                         dados["time_left"] = info_ativo.get("session-time-left", "Ilimitado")
                     else:
                         dados["is_online"] = False
-                        dados["time_left"] = "Offline"
+                        # Se for ilimitado e bypassado, ele não aparece no active do hotspot, mas está online na rede
+                        if dados.get("time_left") == "Tempo Ilimitado":
+                            dados["is_online"] = True 
+                        else:
+                            dados["time_left"] = "Offline"
                 
                 conexao.disconnect()
         except Exception as e:
@@ -80,26 +84,48 @@ def executar_acao(acao, mac):
             api = conexao.get_api()
             recurso_user = api.get_resource('/ip/hotspot/user')
             recurso_host = api.get_resource('/ip/hotspot/host')
+            recurso_binding = api.get_resource('/ip/hotspot/ip-binding')
+            recurso_dhcp = api.get_resource('/ip/dhcp-server/lease')
             
-            # 1. CONFIGURA O USUÁRIO (Sem forçar o 'address'. O MikroTik dará o IP da Pool do Perfil)
-            parametros_mk = {
-                'password': senha_gerada, 
-                'mac-address': mac, 
-                'profile': perfil,
-                'disabled': 'false',
-                'comment': f"Nome: {nome_cliente}"
-            }
-            
-            usuarios_existentes = recurso_user.get(name=usuario_gerado)
-            
-            if usuarios_existentes:
-                parametros_mk['id'] = usuarios_existentes[0]['id']
-                recurso_user.set(**parametros_mk)
+            # ================================================================
+            # 1. CONFIGURAÇÃO BASEADA NO PLANO (ILIMITADO x COM TEMPO)
+            # ================================================================
+            if perfil == "ilimitado":
+                # Para ilimitado, usamos IP Binding Bypassed (Fixa o IP e nunca mais pede senha)
+                bindings = recurso_binding.get(mac_address=mac)
+                if bindings:
+                    recurso_binding.set(id=bindings[0]['id'], type='bypassed', comment=f"Ilimitado: {nome_cliente}")
+                else:
+                    recurso_binding.add(mac_address=mac, type='bypassed', comment=f"Ilimitado: {nome_cliente}")
+                
+                # Remove do Hotspot User caso ele tivesse um plano de tempo antes
+                usuarios_existentes = recurso_user.get(name=usuario_gerado)
+                for u in usuarios_existentes: recurso_user.remove(id=u['id'])
+                
             else:
-                parametros_mk['name'] = usuario_gerado
-                recurso_user.add(**parametros_mk)
+                # Planos com tempo: Remove do Binding (se estava ilimitado antes) e cria usuário
+                bindings = recurso_binding.get(mac_address=mac)
+                for b in bindings: recurso_binding.remove(id=b['id'])
+
+                parametros_mk = {
+                    'password': senha_gerada, 
+                    'mac-address': mac, 
+                    'profile': perfil,
+                    'disabled': 'false',
+                    'comment': f"Nome: {nome_cliente}"
+                }
+                
+                usuarios_existentes = recurso_user.get(name=usuario_gerado)
+                if usuarios_existentes:
+                    parametros_mk['id'] = usuarios_existentes[0]['id']
+                    recurso_user.set(**parametros_mk)
+                else:
+                    parametros_mk['name'] = usuario_gerado
+                    recurso_user.add(**parametros_mk)
             
-            # 2. DERRUBA TUDO PARA FORÇAR A TROCA DO IP E DA POOL NO APARELHO
+            # ================================================================
+            # 2. DERRUBA AS SESSÕES E O DHCP PARA FORÇAR RENOVAÇÃO DO IP
+            # ================================================================
             
             # A) Derruba o usuário do Active (se existir)
             actives = api.get_resource('/ip/hotspot/active').get()
@@ -115,10 +141,9 @@ def executar_acao(acao, mac):
                         recurso_host.remove(id=h['id'])
                     except: pass
             
-            # C) Apaga o registro no DHCP Server (Lease da pool de login)
-            # Isso força o aparelho a pedir um IP novo e ser encaixado na pool do perfil
+            # C) Apaga o registro no DHCP Server (Lease antigo da pool de login)
+            # Isso força o aparelho a pedir um IP novo e ser encaixado na pool certa
             try:
-                recurso_dhcp = api.get_resource('/ip/dhcp-server/lease')
                 leases = recurso_dhcp.get()
                 for l in leases:
                     if l.get('mac-address', '').upper() == mac:
@@ -130,7 +155,11 @@ def executar_acao(acao, mac):
 
             solicitacoes[mac].update({"status": "aprovado", "user": usuario_gerado, "password": senha_gerada, "is_online": False, "time_left": txt_tempo})
             
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Perfil:* {perfil}\n*Ação:* Forçando renovação de IP via DHCP\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            if perfil == "ilimitado":
+                msg = f"✅ *Acesso Aprovado (Bypass Ativado)!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Ação:* IP fixado e login automático garantido.\n*MAC:* {mac}"
+            else:
+                msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {nome_cliente}\n*Tempo:* {txt_tempo}\n*Perfil:* {perfil}\n*Ação:* DHCP renovado para a Pool do perfil.\n*Usuário:* {usuario_gerado}\n*MAC:* {mac}"
+            
             return True, "aprovado", msg
 
         except Exception as e:
@@ -147,10 +176,17 @@ def executar_acao(acao, mac):
             conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
             api = conexao.get_api()
             
+            # Bloqueia usuário normal
             users = api.get_resource('/ip/hotspot/user').get(name=usuario_gerado)
             for u in users:
                 api.get_resource('/ip/hotspot/user').set(id=u['id'], disabled='true')
             
+            # Remove do IP Binding caso seja ilimitado
+            recurso_binding = api.get_resource('/ip/hotspot/ip-binding')
+            bindings = recurso_binding.get(mac_address=mac_cliente)
+            for b in bindings: recurso_binding.remove(id=b['id'])
+            
+            # Derruba as sessões ativas
             actives = api.get_resource('/ip/hotspot/active').get()
             for a in actives:
                 if a.get('mac-address', '').upper() == mac_cliente or a.get('user') == usuario_gerado:
@@ -158,7 +194,7 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
             solicitacoes[mac].update({"status": "desconectado", "is_online": False, "time_left": "-"})
-            return True, "desconectado", f"🛑 *Usuário Desconectado!*\n\nA conexão de {nome_cliente} ({usuario_gerado}) foi encerrada."
+            return True, "desconectado", f"🛑 *Acesso Encerrado!*\n\nA conexão de {nome_cliente} foi bloqueada e removida da rede."
             
         except Exception as e:
             return False, "erro", f"Erro ao desconectar: {e}"
@@ -177,7 +213,7 @@ def solicitar():
     markup = InlineKeyboardMarkup()
     markup.row(InlineKeyboardButton("⏱ 10 Min", callback_data=f"aceitar_10m_{mac}"), InlineKeyboardButton("⏱ 30 Min", callback_data=f"aceitar_30m_{mac}"))
     markup.row(InlineKeyboardButton("⏳ 1 Hora", callback_data=f"aceitar_1h_{mac}"), InlineKeyboardButton("⏳ 5 Horas", callback_data=f"aceitar_5h_{mac}"))
-    markup.row(InlineKeyboardButton("♾️ Ilimitado", callback_data=f"aceitar_ilim_{mac}"), InlineKeyboardButton("❌ Recusar", callback_data=f"recusar_{mac}"))
+    markup.row(InlineKeyboardButton("♾️ Ilimitado (Bypass)", callback_data=f"aceitar_ilim_{mac}"), InlineKeyboardButton("❌ Recusar", callback_data=f"recusar_{mac}"))
     
     mensagem = f"🔔 *NOVA SOLICITAÇÃO DE ACESSO*\n\n*Nome:* {nome}\n*IP Solicitante:* {ip}\n*MAC:* {mac}\n\nEscolha o tempo de liberação:"
     
@@ -327,7 +363,7 @@ HTML_ADMIN = """
                             <button class="btn btn-red" onclick="fazerAcao('recusar', '${mac}')">Recusar</button>
                         `;
                     } else if(req.status === 'aprovado') {
-                        botoes = `<button class="btn btn-red" onclick="fazerAcao('desconectar', '${mac}')">🛑 Desconectar Usuário</button>`;
+                        botoes = `<button class="btn btn-red" onclick="fazerAcao('desconectar', '${mac}')">🛑 Encerrar Acesso</button>`;
                         
                         let stOnline = req.is_online ? '<span class="online">🟢 Online</span>' : '<span class="offline">🔴 Offline</span>';
                         let timeText = req.time_left || '-';
@@ -370,7 +406,7 @@ def admin_acao():
                 if status_result == "aprovado":
                     markup_desc = InlineKeyboardMarkup()
                     markup_desc.add(
-                        InlineKeyboardButton("🛑 Desconectar Usuário", callback_data=f"desconectar_{mac}"),
+                        InlineKeyboardButton("🛑 Encerrar Acesso", callback_data=f"desconectar_{mac}"),
                         InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
                     )
                     bot.edit_message_text(f"💻 *Aprovado via Painel Web:*\n\n{msg}", chat_id=ADMIN_CHAT_ID, message_id=msg_id, parse_mode="Markdown", reply_markup=markup_desc)
@@ -391,11 +427,11 @@ def callback_query(call):
             st_txt = "🟢 *Online*" if req.get("is_online") else "🔴 *Offline*"
             tempo_txt = req.get("time_left", "N/A")
             
-            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {req['nome']}\n*Usuário:* {req['user']}\n*MAC:* {mac}\n\n*Status Conexão:* {st_txt}\n*Tempo Restante:* {tempo_txt}"
+            msg = f"✅ *Acesso Aprovado!*\n\n*Nome:* {req['nome']}\n*MAC:* {mac}\n\n*Status Conexão:* {st_txt}\n*Tempo Restante:* {tempo_txt}"
             
             markup_desc = InlineKeyboardMarkup()
             markup_desc.add(
-                InlineKeyboardButton("🛑 Desconectar", callback_data=f"desconectar_{mac}"),
+                InlineKeyboardButton("🛑 Encerrar Acesso", callback_data=f"desconectar_{mac}"),
                 InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
             )
             try:
@@ -413,7 +449,7 @@ def callback_query(call):
         if status_result == "aprovado":
             markup_desc = InlineKeyboardMarkup()
             markup_desc.add(
-                InlineKeyboardButton("🛑 Desconectar", callback_data=f"desconectar_{mac}"),
+                InlineKeyboardButton("🛑 Encerrar Acesso", callback_data=f"desconectar_{mac}"),
                 InlineKeyboardButton("🔄 Atualizar Status", callback_data=f"atualizar_{mac}")
             )
             bot.edit_message_text(msg, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=markup_desc)
