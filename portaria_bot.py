@@ -14,7 +14,10 @@ ADMIN_CHAT_ID = '8748799831'
 
 MK_IP = '10.100.10.1' 
 MK_USER = 'bot'    
-MK_PASS = 'Cleuven2106.'   
+MK_PASS = 'Cleuven2106.'
+
+# Senha para acessar o menu web
+WEB_ADMIN_PASS = '123456'
 
 app = Flask(__name__)
 CORS(app)
@@ -39,7 +42,6 @@ def monitorar_conexoes():
                 hosts_ativos = api.get_resource('/ip/hotspot/host').get()
                 hosts_macs = [h.get('mac-address', '').upper() for h in hosts_ativos]
 
-                # Criamos uma lista para quem esgotou o tempo (evita bugar o loop iterando o dicionário)
                 macs_para_desconectar = []
 
                 for mac, dados in solicitacoes.items():
@@ -51,34 +53,28 @@ def monitorar_conexoes():
                     
                     dados["is_online"] = is_in_host or is_in_active
 
-                    # LÓGICA DE CLASSIFICAÇÃO DE ESTADO
                     if dados.get("status") == "aprovado":
                         expire_at = dados.get("expire_at")
                         
-                        # CHECAGEM DO RELÓGIO ABSOLUTO (PYTHON)
                         if expire_at is not None:
                             tempo_restante = int(expire_at - time.time())
                             
                             if tempo_restante <= 0:
                                 macs_para_desconectar.append(mac)
-                                continue # Pula o processamento visual pois ele será cortado agora
+                                continue
                             
-                            # Formata o tempo restante (00h 00m 00s)
                             m, s = divmod(tempo_restante, 60)
                             h, m = divmod(m, 60)
                             dados["time_left"] = f"{h}h {m}m" if h > 0 else f"{m}m {s}s"
                         else:
                             dados["time_left"] = "Ilimitado"
 
-                        # DEFINE STATUS VISUAL
                         if is_in_active or (expire_at is None and is_in_host):
                             dados["estado_texto"] = "Conectado Autorizado"
                         else:
-                            # Mesmo que ele desligue o Wi-fi, o status mostra o tempo descendo
                             dados["estado_texto"] = "Offline (Tempo Correndo)"
                             
                     else:
-                        # Pendente, Recusado ou Desconectado
                         dados["time_left"] = "-"
                         if is_in_host:
                             dados["estado_texto"] = "Conectado S/ Autorizacao"
@@ -87,7 +83,6 @@ def monitorar_conexoes():
                 
                 conexao.disconnect()
 
-                # Desconecta ativamente quem esgotou o tempo
                 for m in macs_para_desconectar:
                     executar_acao("desconectar", m)
 
@@ -106,7 +101,6 @@ def executar_acao(acao, mac):
     nome_cliente = solicitacoes[mac].get('nome', 'Visitante')
 
     if acao.startswith("aceitar"):
-        # Mapeando os tempos e calculando segundos absolutos
         segundos = 0
         if "10m" in acao: txt_tempo = "10 Minutos"; perfil = "10m"; segundos = 600
         elif "30m" in acao: txt_tempo = "30 Minutos"; perfil = "30m"; segundos = 1800
@@ -177,10 +171,8 @@ def executar_acao(acao, mac):
 
             conexao.disconnect()
 
-            # LÓGICA DE TEMPO ABSOLUTO EM PYTHON
             expire_time = time.time() + segundos if segundos > 0 else None
 
-            # Status visual será ajustado pela Thread de monitoramento nos próximos 10 segundos
             solicitacoes[mac].update({
                 "status": "aprovado", 
                 "user": usuario_gerado, 
@@ -269,6 +261,46 @@ def status():
 def admin_dados():
     return jsonify(solicitacoes)
 
+# === ROTA DO MENU DE CONFIGURAÇÃO MIKROTIK ===
+@app.route('/admin/config_mk', methods=['POST'])
+def config_mk():
+    dados = request.json
+    senha = dados.get('senha')
+    
+    if senha != WEB_ADMIN_PASS:
+        return jsonify({"sucesso": False, "mensagem": "Senha incorreta. Acesso negado."})
+    
+    acao = dados.get('acao')
+    
+    try:
+        conexao = routeros_api.RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
+        api = conexao.get_api()
+        
+        if acao == "criar_perfil":
+            nome_perfil = dados.get('nome_perfil')
+            session_time = dados.get('session_time')
+            rate_limit = dados.get('rate_limit') # Ex: 5M/5M
+            
+            recurso_profile = api.get_resource('/ip/hotspot/user/profile')
+            existente = recurso_profile.get(name=nome_perfil)
+            
+            parametros = {'session-timeout': session_time, 'rate-limit': rate_limit, 'shared-users': '1'}
+            # Filtra parametros vazios
+            parametros = {k: v for k, v in parametros.items() if v}
+            
+            if existente:
+                recurso_profile.set(id=existente[0]['id'], **parametros)
+                msg = f"Perfil '{nome_perfil}' atualizado na RB!"
+            else:
+                recurso_profile.add(name=nome_perfil, **parametros)
+                msg = f"Perfil '{nome_perfil}' criado na RB!"
+                
+        conexao.disconnect()
+        return jsonify({"sucesso": True, "mensagem": msg})
+        
+    except Exception as e:
+        return jsonify({"sucesso": False, "mensagem": f"Erro na RB: {str(e)}"})
+
 
 # === PAINEL DE GERÊNCIA WEB AVANÇADO ===
 HTML_ADMIN = """
@@ -281,15 +313,28 @@ HTML_ADMIN = """
     <style>
         * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         body { background-color: #eef2f5; padding: 20px; color: #333; margin: 0; }
-        .container { max-width: 1050px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
+        .container { max-width: 1050px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); position: relative; }
         h2 { text-align: center; color: #2563eb; margin-top: 0; }
         
-        #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 5px; padding: 16px; position: fixed; z-index: 1; right: 20px; top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: 0.3s; }
+        #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 5px; padding: 16px; position: fixed; z-index: 100; right: 20px; top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: 0.3s; }
         #toast.show { visibility: visible; }
         #toast.success { background-color: #10b981; }
         #toast.error { background-color: #ef4444; }
 
-        .tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; }
+        /* Estilos do Botão Menu e Modal */
+        .menu-btn { position: absolute; top: 20px; left: 20px; background: #2563eb; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-weight: bold; }
+        .menu-btn:hover { background: #1d4ed8; }
+        
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 50; }
+        .modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 25px; border-radius: 10px; width: 90%; max-width: 400px; z-index: 51; box-shadow: 0 10px 25px rgba(0,0,0,0.2); display: none; }
+        .modal.active, .modal-overlay.active { display: block; }
+        .modal h3 { margin-top: 0; color: #333; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; font-size: 13px; color: #64748b; margin-bottom: 5px; }
+        .form-group input { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 5px; font-size: 14px; }
+        .btn-fechar { float: right; background: none; border: none; font-size: 20px; cursor: pointer; color: #999; }
+
+        .tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; margin-top: 20px; }
         .tab-btn { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; background-color: #e2e8f0; color: #475569; transition: 0.3s; }
         .tab-btn.active { background-color: #2563eb; color: #fff; }
 
@@ -301,7 +346,6 @@ HTML_ADMIN = """
         table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
         th, td { padding: 15px 10px; border-bottom: 1px solid #eee; text-align: center; vertical-align: middle; }
         th { background-color: #f8fafc; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-        tr:hover { background-color: #f8fafc; }
         
         .btn { padding: 8px 12px; margin: 3px; border: none; border-radius: 6px; cursor: pointer; color: white; font-weight: 600; font-size: 12px; transition: 0.2s; }
         .btn-green { background-color: #10b981; } .btn-green:hover { background-color: #059669; }
@@ -323,7 +367,29 @@ HTML_ADMIN = """
 <body>
     <div id="toast">Notificação</div>
 
+    <div class="modal-overlay" id="modalOverlay" onclick="fecharModal()"></div>
+    <div class="modal" id="modalConfig">
+        <button class="btn-fechar" onclick="fecharModal()">&times;</button>
+        <h3>⚙️ Configuração na RB</h3>
+        
+        <div class="form-group">
+            <label>Nome do Perfil (Ex: 30m, 1h, Visitante)</label>
+            <input type="text" id="mk_nome_perfil" placeholder="Nome do perfil">
+        </div>
+        <div class="form-group">
+            <label>Tempo de Sessão (Ex: 00:30:00 para 30 min, vazio para ilimitado)</label>
+            <input type="text" id="mk_session_time" placeholder="00:30:00">
+        </div>
+        <div class="form-group">
+            <label>Limite de Banda / Queue (Ex: 5M/5M, 10M/10M)</label>
+            <input type="text" id="mk_rate_limit" placeholder="5M/5M">
+        </div>
+        <button class="btn btn-blue" style="width: 100%; font-size: 14px; padding: 10px;" onclick="salvarPerfilRB()">Enviar para RB</button>
+    </div>
+
     <div class="container">
+        <button class="menu-btn" onclick="abrirMenu()">☰ Menu RB</button>
+        
         <h2>Painel de Gerência Hotspot</h2>
         <div style="text-align: center; margin-bottom: 20px; color: #64748b; font-size: 13px;">
             <span class="live-indicator"></span> Monitoramento Inteligente: Calculando tempo no servidor
@@ -351,6 +417,7 @@ HTML_ADMIN = """
 
     <script>
         let filtroAtual = 'online';
+        let senhaAdmin = '';
 
         function showToast(msg, tipo) {
             const toast = document.getElementById("toast");
@@ -359,6 +426,55 @@ HTML_ADMIN = """
             setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
         }
 
+        /* Lógica do Menu Modal */
+        function abrirMenu() {
+            if(!senhaAdmin) {
+                let senha = prompt("Digite a senha administrativa:");
+                if(senha) { senhaAdmin = senha; } else { return; }
+            }
+            document.getElementById('modalOverlay').classList.add('active');
+            document.getElementById('modalConfig').classList.add('active');
+        }
+
+        function fecharModal() {
+            document.getElementById('modalOverlay').classList.remove('active');
+            document.getElementById('modalConfig').classList.remove('active');
+        }
+
+        function salvarPerfilRB() {
+            const btn = event.target;
+            btn.innerText = "Enviando...";
+            
+            const dados = {
+                senha: senhaAdmin,
+                acao: 'criar_perfil',
+                nome_perfil: document.getElementById('mk_nome_perfil').value,
+                session_time: document.getElementById('mk_session_time').value,
+                rate_limit: document.getElementById('mk_rate_limit').value
+            };
+
+            fetch('/admin/config_mk', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(dados)
+            })
+            .then(res => res.json())
+            .then(data => {
+                btn.innerText = "Enviar para RB";
+                if(data.sucesso) {
+                    showToast(data.mensagem, "success");
+                    fecharModal();
+                } else {
+                    showToast(data.mensagem, "error");
+                    if(data.mensagem.includes("Senha")) senhaAdmin = ''; // Reseta se errou
+                }
+            }).catch(e => {
+                btn.innerText = "Enviar para RB";
+                showToast("Erro de conexão.", "error");
+            });
+        }
+
+        /* Lógica Original da Tabela */
         function mudarAba(aba) {
             filtroAtual = aba;
             document.getElementById('btn-online').classList.remove('active');
@@ -403,10 +519,8 @@ HTML_ADMIN = """
                     
                     let mostrar = false;
                     if (filtroAtual === 'online') {
-                        // Está na rede local grudado na antena
                         if (req.is_online === true) mostrar = true;
                     } else if (filtroAtual === 'offline') {
-                        // Não está na rede local
                         if (req.is_online === false) mostrar = true;
                     }
 
@@ -418,7 +532,6 @@ HTML_ADMIN = """
                     let stHtml = '';
                     let timeText = req.time_left || '-';
                     
-                    // Renderização visual dos novos estados
                     if (req.estado_texto === "Conectado Autorizado") {
                         stHtml = `<div class="conexao-info estado-verde">🟢 Autorizado e Navegando<span class="tempo">⏳ Tempo: ${timeText}</span></div>`;
                     } else if (req.estado_texto === "Conectado S/ Autorizacao") {
@@ -429,7 +542,6 @@ HTML_ADMIN = """
                         stHtml = `<div class="conexao-info estado-vermelho">🔴 Offline e Sem Acesso<span class="tempo">Fora da rede</span></div>`;
                     }
 
-                    // Ações disponíveis dependendo se está aprovado ou não
                     if(req.status === 'pendente' || req.status === 'desconectado' || req.status === 'recusado') {
                         botoes = `
                             <button class="btn btn-green" onclick="fazerAcao('aceitar_10m', '${mac}')">10m</button>
